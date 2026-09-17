@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -119,3 +120,174 @@ async def test_upstream_failure_propagates(key_pair: tuple[str, str]) -> None:
         client = JwksClient(JWKS_URL, http)
         with pytest.raises(httpx.HTTPStatusError):
             await client.get_key("test-kid")
+
+
+# --- Раунд правок 1: троттлинг не держит параллельную нагрузку, а сбой
+# источника при пустом кэше не должен маскироваться под «неизвестный kid». ---
+
+
+async def test_unknown_kid_swarm_on_cold_start_triggers_one_fetch(
+    key_pair: tuple[str, str],
+) -> None:
+    """Параллельная нагрузка не обходит троттлинг, в отличие от последовательной.
+
+    Последовательный цикл с `await` внутри никогда не заставал бы вторую
+    корутину раньше, чем первая обновит кэш — поэтому такой тест не поймал
+    бы гонку. Здесь все 20 обращений стартуют одновременно, а обработчик
+    сам `await`-ит, чтобы честно уступить event loop и впустить остальные
+    19 корутин, пока первая ещё «в полёте» — иначе `MockTransport` без
+    единой настоящей точки приостановки просто выполнил бы 20 корутин одну
+    за одной, и гонка никогда бы не проявилась.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="test-kid")
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        results = await asyncio.gather(
+            *(client.get_key("nope") for _ in range(20)),
+            return_exceptions=True,
+        )
+
+    assert len(calls) == 1
+    assert all(isinstance(result, UnknownSigningKeyError) for result in results)
+
+
+async def test_concurrent_call_for_a_key_being_fetched_waits_instead_of_guessing(
+    key_pair: tuple[str, str],
+) -> None:
+    """Запрос, заставший загрузку в процессе, дожидается её, а не гадает.
+
+    Троттлинг мешает начать новую попытку, пока предыдущая ещё не
+    отметилась как завершённая — но если конкурентный вызов из-за этого
+    просто пропускает `_attempt_fetch`, он читает ещё пустой кэш и
+    ошибочно отвергает валидный (в том числе только что провернутый) kid,
+    хотя тот появится через миг, когда загрузка, идущая прямо сейчас,
+    завершится. Правильное поведение — дождаться её и переоценить кэш.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="test-kid")
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        results = await asyncio.gather(
+            *(client.get_key("test-kid") for _ in range(20)),
+        )
+
+    assert len(calls) == 1
+    assert all(pem.startswith("-----BEGIN PUBLIC KEY-----") for pem in results)
+
+
+async def test_concurrent_burst_after_the_window_triggers_one_fetch(
+    key_pair: tuple[str, str],
+) -> None:
+    """Стадо, заставшее и TTL, и окно троттлинга истёкшими, даёт один запрос.
+
+    Как и в предыдущем тесте, обработчик сам приостанавливается, чтобы
+    все 20 корутин всплеска реально пересеклись во времени, а не выполнились
+    одна за другой.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="test-kid")
+    calls: list[httpx.Request] = []
+
+    expected_calls = 2  # прогрев + один общий рефетч на весь всплеск
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http, ttl=0.2, min_refetch_interval=0.2)
+        await client.get_key("test-kid")
+        await asyncio.sleep(0.3)
+
+        results = await asyncio.gather(
+            *(client.get_key("test-kid") for _ in range(20)),
+        )
+
+    assert len(calls) == expected_calls
+    assert all(pem.startswith("-----BEGIN PUBLIC KEY-----") for pem in results)
+
+
+async def test_upstream_outage_is_retried_at_most_once_per_window() -> None:
+    """Лежащий источник получает не больше одного запроса за окно троттлинга.
+
+    Без отдельной отметки времени неудачной попытки `_fetched_at` остаётся
+    None навсегда, кэш вечно «устарел», и каждый вызов бьёт по сети заново.
+    """
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        for _ in range(10):
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.get_key("test-kid")
+
+    assert len(calls) == 1
+
+
+async def test_upstream_outage_error_is_not_masked_as_unknown_key() -> None:
+    """Авария источника не должна выглядеть как «неизвестный ключ».
+
+    Пустой кэш плюс отказ от повторной попытки внутри окна троттлинга не
+    равно «такого kid у нас нет» — это «мы не смогли проверить». Наружу
+    обязана выйти именно ошибка источника, причём та же, что и в первый раз.
+    """
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        with pytest.raises(httpx.HTTPStatusError) as first:
+            await client.get_key("test-kid")
+        with pytest.raises(httpx.HTTPStatusError) as second:
+            await client.get_key("test-kid")
+
+    assert type(second.value) is httpx.HTTPStatusError
+    assert not isinstance(second.value, UnknownSigningKeyError)
+    assert second.value is first.value
+
+
+async def test_unknown_kid_with_warm_cache_raises_unknown_key_not_source_error(
+    jwks_transport: tuple[httpx.MockTransport, list[httpx.Request]],
+) -> None:
+    """Непустой кэш с неизвестным kid — по-прежнему «не наш ключ», а не авария.
+
+    Регрессионная проверка: различение аварии и неизвестного kid не должно
+    задевать исходное поведение при живом источнике.
+    """
+    transport, _ = jwks_transport
+
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = JwksClient(JWKS_URL, http)
+        await client.get_key("test-kid")
+        with pytest.raises(UnknownSigningKeyError):
+            await client.get_key("nope")
+
+
+async def test_ttl_below_min_refetch_interval_is_rejected() -> None:
+    """Клиент отвергает ttl меньше окна троттлинга при конструировании."""
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ValueError, match="ttl"):
+            JwksClient(JWKS_URL, http, ttl=1.0, min_refetch_interval=2.0)
