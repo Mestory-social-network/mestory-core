@@ -249,7 +249,11 @@ async def test_upstream_outage_error_is_not_masked_as_unknown_key() -> None:
 
     Пустой кэш плюс отказ от повторной попытки внутри окна троттлинга не
     равно «такого kid у нас нет» — это «мы не смогли проверить». Наружу
-    обязана выйти именно ошибка источника, причём та же, что и в первый раз.
+    обязана выйти ошибка источника того же типа и с тем же сообщением, что
+    и в первый раз — но не тот же самый объект: повторный `raise` одного и
+    того же экземпляра бесконечно растил бы его `__traceback__` (см.
+    отдельный тест на это), поэтому второй вызов обязан получить свежую
+    копию, связанную с исходной через `__cause__`.
     """
     calls: list[httpx.Request] = []
 
@@ -266,7 +270,46 @@ async def test_upstream_outage_error_is_not_masked_as_unknown_key() -> None:
 
     assert type(second.value) is httpx.HTTPStatusError
     assert not isinstance(second.value, UnknownSigningKeyError)
-    assert second.value is first.value
+    assert str(second.value) == str(first.value)
+    assert second.value is not first.value
+    assert second.value.__cause__ is first.value
+
+
+async def test_upstream_outage_does_not_grow_the_traceback_chain() -> None:
+    """Повторные отказы в окне отката не удлиняют traceback без предела.
+
+    `raise self._last_error` на уже поднятом объекте добавлял бы кадры
+    текущего вызова к его `__traceback__` при каждом обращении — и так все
+    время, пока источник не поднимется: 30 отказов подряд внутри окна
+    отката ничем не отличаются по нагрузке на память и логи от одного,
+    если каждый раз перевыбрасывается свежая копия с чистым traceback.
+    """
+
+    def traceback_length(tb: object) -> int:
+        length = 0
+        while tb is not None:
+            length += 1
+            tb = tb.tb_next  # type: ignore[attr-defined]
+        return length
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        lengths: list[int] = []
+        for _ in range(30):
+            with pytest.raises(httpx.HTTPStatusError) as caught:
+                await client.get_key("test-kid")
+            lengths.append(traceback_length(caught.value.__traceback__))
+
+    # Первый вызов и правда идёт через _fetch(), поэтому его traceback
+    # длиннее — это не рост, а другой путь. Важно, что все последующие,
+    # throttled-повторы (каждый раз — свежая копия ошибки) не растут между
+    # собой: 29 отказов подряд внутри окна отката держат одну и ту же
+    # длину, а не удлиняются на каждый вызов.
+    retried = lengths[1:]
+    assert max(retried) == min(retried)
 
 
 async def test_unknown_kid_with_warm_cache_raises_unknown_key_not_source_error(
