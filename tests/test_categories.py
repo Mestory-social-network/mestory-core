@@ -2,7 +2,7 @@ from mestory_core.categories import Category
 
 
 def test_categories_cover_the_mvp_board() -> None:
-    """Справочник совпадает с категориями с MVP-доски."""  # noqa: RUF002
+    """Справочник совпадает с категориями с MVP-доски."""
     assert {category.value for category in Category} == {
         "coffee",
         "restaurant",

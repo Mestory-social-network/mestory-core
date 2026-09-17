@@ -18,7 +18,7 @@ def test_default_role_is_user() -> None:
 
 
 def test_every_role_has_a_permission_set() -> None:
-    """В карте прав нет роли без описанного набора."""  # noqa: RUF002
+    """В карте прав нет роли без описанного набора."""
     assert set(ALL_ROLES) == set(ROLE_PERMISSIONS)
 
 
@@ -38,7 +38,7 @@ def test_moderator_cannot_delete_or_grant_roles() -> None:
 def test_unknown_role_grants_nothing() -> None:
     """Роль, которой нет в карте, не расширяет доступ.
 
-    Наборы ролей едят внутри токенов и переживают переименование; неизвестное
+    Наборы ролей ездят внутри токенов и переживают переименование; неизвестное
     имя обязано не значить ничего.
     """
     assert permissions_for_roles(["ghost"]) == frozenset()
