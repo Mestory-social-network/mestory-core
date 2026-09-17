@@ -273,6 +273,41 @@ async def test_upstream_outage_error_is_not_masked_as_unknown_key() -> None:
     assert str(second.value) == str(first.value)
     assert second.value is not first.value
     assert second.value.__cause__ is first.value
+    # .request/.response не выставлены конструктором HTTPStatusError
+    # напрямую из args — они переданы отдельными keyword-only аргументами
+    # и обязаны пережить пересоздание точно так же, как и тип с сообщением.
+    assert second.value.request is first.value.request
+    assert second.value.response is first.value.response
+
+
+async def test_connection_outage_keeps_request_accessible_after_respawn() -> None:
+    """Пересозданная сетевая ошибка не должна ронять `.request` `RuntimeError`.
+
+    У `httpx.RequestError` (и его семейства — `ConnectError`,
+    `ReadTimeout` и прочих) параметр `request` в конструкторе
+    необязателен, поэтому наивное пересоздание через `cls(*exc.args)`
+    проходит без `TypeError` и выглядит «удачным» путём — но настоящий
+    объект запроса httpx привязывает к исключению уже ПОСЛЕ конструктора
+    (`exc.request = request` в `request_context`), и это тот путь,
+    которым транспорт реально бросает `ConnectError` — без `request=` в
+    самом вызове. Задача 9 будет логировать `exc.request.url` (приём из
+    документации httpx) — без сохранения этой привязки такой код упал бы
+    `RuntimeError`-ом посреди спокойного превращения аварии в 503.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        with pytest.raises(httpx.ConnectError) as first:
+            await client.get_key("test-kid")
+        with pytest.raises(httpx.ConnectError) as second:
+            await client.get_key("test-kid")
+
+    assert first.value.request is not None
+    assert second.value.request is not None
+    assert second.value.request is first.value.request
 
 
 async def test_upstream_outage_does_not_grow_the_traceback_chain() -> None:
