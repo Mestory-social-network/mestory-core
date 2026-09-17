@@ -48,10 +48,6 @@ show_error_codes = true
 [tool.ruff]
 target-version = "py313"
 line-length = 88
-# Allow Cyrillic lookalike characters in docstrings. Russian documentation
-# uses characters like а, А, В, е, Е, З, К, М, Н, о, О, р, Р, с, С, Т, у, У, х, Х
-# which are homographs with Latin letters. This is normal for Russian text and should not trigger RUF002.
-lint.allowed-confusables = ["а", "А", "В", "е", "Е", "З", "К", "М", "Н", "о", "О", "р", "Р", "с", "С", "Т", "у", "У", "х", "Х"]
 lint.select = [
   "E", "F", "W", "C90", "I", "N", "D", "ANN", "S", "B", "C4", "ISC",
   "PIE", "T20", "PYI", "Q", "RSE", "RET", "SLF", "SIM", "PTH", "ERA",
@@ -60,6 +56,11 @@ lint.select = [
 lint.ignore = [
   "D105", "D107", "B008", "D211", "D212", "D401", "D104", "D100",
   "D202", "ANN401", "PLR0913", "D106", "UP043",
+  # Докстринги и комментарии проекта написаны по-русски целиком, поэтому
+  # правила о неоднозначных Unicode-символах для них — чистый шум.
+  # RUF001 намеренно оставлен включённым: кириллица в строковом литерале —
+  # вероятная ошибка (например, спутанная буква в идентификаторе-строке).
+  "RUF002", "RUF003",
 ]
 lint.mccabe = { max-complexity = 10 }
 
