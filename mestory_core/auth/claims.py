@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime
 
 import jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 JWT_ALGORITHM = "RS256"
 TOKEN_TYPE_ACCESS = "access"  # noqa: S105
@@ -57,7 +57,8 @@ def verify_access_token(
     :param issuer: ожидаемый издатель.
     :return: проверенные claims.
     :raises jwt.InvalidTokenError: если токен повреждён, истёк, подписан
-        другим ключом или не является access-токеном.
+        другим ключом, не является access-токеном или его claims не
+        проходят валидацию модели.
     """
     payload = jwt.decode(
         token,
@@ -71,4 +72,9 @@ def verify_access_token(
         raise jwt.InvalidTokenError(
             f"Expected token type {TOKEN_TYPE_ACCESS!r}, got {payload.get('type')!r}.",
         )
-    return AccessTokenClaims.model_validate(payload)
+    try:
+        return AccessTokenClaims.model_validate(payload)
+    except ValidationError as exc:
+        raise jwt.InvalidTokenError(
+            f"Token claims failed validation: {exc}",
+        ) from exc

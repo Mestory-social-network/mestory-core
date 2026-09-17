@@ -1,3 +1,8 @@
+import base64
+import hashlib
+import hmac
+import json
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -6,6 +11,37 @@ import pytest
 
 from mestory_core.auth.claims import AccessTokenClaims, verify_access_token
 from tests.conftest import AUDIENCE, ISSUER
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _forge_hs256_token(payload: dict[str, object], secret: str) -> str:
+    """
+    Собрать HS256-токен вручную, в обход собственной защиты PyJWT.
+
+    `jwt.encode(..., algorithm="HS256")` отказывается использовать PEM-ключ
+    как HMAC-секрет ("asymmetric key... should not be used as an HMAC
+    secret") — это подсказка на этапе выпуска, а не на этапе проверки.
+    Атакующий, подделывающий токен, эту подсказку игнорирует и просто
+    хэширует байты публичного PEM вручную. Именно это здесь и делается,
+    чтобы протестировать защиту verify_access_token на этапе decode
+    (`algorithms=[JWT_ALGORITHM]`), а не защиту PyJWT на этапе encode.
+
+    :param payload: claims токена (timestamps — уже int, не datetime).
+    :param secret: строка, используемая как HMAC-секрет.
+    :return: собранный JWT.
+    """
+    header_b64 = _b64url(
+        json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode(),
+    )
+    payload_b64 = _b64url(
+        json.dumps(payload, separators=(",", ":")).encode(),
+    )
+    signing_input = f"{header_b64}.{payload_b64}".encode()
+    signature = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+    return f"{signing_input.decode()}.{_b64url(signature)}"
 
 
 def test_valid_token_is_parsed(
@@ -107,6 +143,102 @@ def test_expired_token_is_rejected(
     with pytest.raises(jwt.InvalidTokenError):
         verify_access_token(
             make_token(iat=past, exp=past + timedelta(minutes=15)),
+            public_pem,
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+
+
+def test_broken_roles_field_is_rejected_as_invalid_token(
+    key_pair: tuple[str, str],
+    make_token: Callable[..., str],
+) -> None:
+    """Подписанный токен со сломанным полем roles не течёт наружу как ValidationError.
+
+    Задача 9 строит поверх verify_access_token FastAPI-зависимость, которая
+    ловит ровно jwt.InvalidTokenError и превращает его в 401. Необёрнутая
+    pydantic.ValidationError не наследует InvalidTokenError и вылетела бы
+    наружу как необработанный 500.
+    """
+    _, public_pem = key_pair
+
+    with pytest.raises(jwt.InvalidTokenError):
+        verify_access_token(
+            make_token(roles="не список"),
+            public_pem,
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+
+
+def test_broken_is_verified_field_is_rejected_as_invalid_token(
+    key_pair: tuple[str, str],
+    make_token: Callable[..., str],
+) -> None:
+    """Подписанный токен со сломанным полем is_verified даёт InvalidTokenError."""
+    _, public_pem = key_pair
+
+    with pytest.raises(jwt.InvalidTokenError):
+        verify_access_token(
+            make_token(is_verified=None),
+            public_pem,
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+
+
+def test_hs256_signed_token_is_rejected(key_pair: tuple[str, str]) -> None:
+    """Токен, подписанный HS256 с публичным PEM в роли HMAC-секрета, не проходит.
+
+    Классическая атака подмены алгоритма: если бы verify_access_token
+    принимала произвольный алгоритм из списка, включающий HS256, публичный
+    RSA-ключ, который все стороны считают публичным, можно было бы
+    использовать как общий HMAC-секрет для подделки токена.
+    """
+    _, public_pem = key_pair
+    issued_at = int(datetime.now(UTC).timestamp())
+    payload = {
+        "sub": str(uuid.uuid4()),
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "jti": str(uuid.uuid4()),
+        "type": "access",
+        "roles": ["user"],
+        "is_verified": True,
+        "iat": issued_at,
+        "exp": issued_at + int(timedelta(minutes=15).total_seconds()),
+    }
+    forged = _forge_hs256_token(payload, public_pem)
+
+    with pytest.raises(jwt.InvalidTokenError):
+        verify_access_token(
+            forged,
+            public_pem,
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+
+
+def test_alg_none_token_is_rejected(key_pair: tuple[str, str]) -> None:
+    """Неподписанный токен с alg: none не проходит проверку."""
+    _, public_pem = key_pair
+    issued_at = datetime.now(UTC)
+    payload = {
+        "sub": str(uuid.uuid4()),
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "jti": str(uuid.uuid4()),
+        "type": "access",
+        "roles": ["user"],
+        "is_verified": True,
+        "iat": issued_at,
+        "exp": issued_at + timedelta(minutes=15),
+    }
+    unsigned = jwt.encode(payload, key=None, algorithm="none")
+
+    with pytest.raises(jwt.InvalidTokenError):
+        verify_access_token(
+            unsigned,
             public_pem,
             audience=AUDIENCE,
             issuer=ISSUER,
