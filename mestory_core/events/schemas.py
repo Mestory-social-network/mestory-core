@@ -163,7 +163,34 @@ class ProfileDeleted(Event):
     user_id: uuid.UUID
 
 
+def _all_event_types(base: type[Event]) -> list[type[Event]]:
+    """
+    Собрать все конкретные подклассы события.
+
+    Тем же обходом, каким тесты проверяют уникальность ключей: рекурсивно
+    по дереву `__subclasses__()`, а не ручным перечислением, которое
+    разойдётся со схемами при первом же добавленном событии.
+
+    :param base: базовый класс, с которого начинать обход.
+    :return: список подклассов `base`.
+    """
+    found: list[type[Event]] = []
+    for subclass in base.__subclasses__():
+        found.append(subclass)
+        found.extend(_all_event_types(subclass))
+    return found
+
+
+# Единый источник правды для потребителя: получив из AMQP routing_key и
+# сырое тело, он находит здесь класс и валидирует тело через
+# model_validate_json — той же моделью, которой издатель его собрал.
+EVENTS_BY_ROUTING_KEY: dict[RoutingKey, type[Event]] = {
+    event_type.routing_key: event_type for event_type in _all_event_types(Event)
+}
+
+
 __all__ = [
+    "EVENTS_BY_ROUTING_KEY",
     "Event",
     "PasswordReset",
     "PasswordResetRequested",
