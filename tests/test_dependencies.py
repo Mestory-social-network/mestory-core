@@ -1,10 +1,12 @@
 """Тесты FastAPI-зависимостей авторизации: 401 / 403 / 503 различимы."""
 
+import base64
 import json
 from collections.abc import Callable
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport
 
@@ -303,3 +305,97 @@ async def test_outage_branch_does_not_swallow_missing_permission(
         )
 
     assert response.status_code == httpx.codes.FORBIDDEN
+
+
+# --- Раунд правок 1: MalformedJwksDocumentError сужает перехват, но 503 за
+# сломанный документ остаётся на месте, а произвольный TypeError — нет. ---
+
+
+async def test_malformed_jwks_document_is_still_503(
+    make_token: Callable[..., str],
+) -> None:
+    """Документ JWKS с не-RSA ключом по-прежнему даёт 503 auth_unavailable.
+
+    Фиксирует, что сужение перехвата в get_claims (с голого TypeError до
+    MalformedJwksDocumentError) не сломало этот случай: испорченный
+    документ — такая же невозможность проверить, как и недоступный сервер.
+    """
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    numbers = private_key.public_key().public_numbers()
+
+    def b64url(value: int) -> str:
+        raw = value.to_bytes(32, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    document = {
+        "keys": [
+            {
+                "kty": "EC",
+                "crv": "P-256",
+                "kid": "test-kid",
+                "x": b64url(numbers.x),
+                "y": b64url(numbers.y),
+            },
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with _client_for(handler) as client:
+        response = await client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {make_token()}"},
+        )
+
+    assert response.status_code == httpx.codes.SERVICE_UNAVAILABLE
+    assert response.json()["detail"]["code"] == "auth_unavailable"
+
+
+class _BuggyVerifier:
+    """Заглушка верификатора, эмулирующая программистский баг в цепочке.
+
+    Настоящий баг где угодно в `verifier.verify()` (например, в
+    `verify_access_token` или в `model_validate`) может всплыть голым
+    `TypeError`. Такой баг обязан остаться громким — get_claims не должен
+    ловить произвольный `TypeError` и подавать его клиенту как спокойное
+    503 «источник недоступен, попробуйте позже».
+    """
+
+    async def verify(self, token: str) -> AccessTokenClaims:
+        """
+        Всегда падать с TypeError, как настоящий баг где-то в проверке.
+
+        :param token: игнорируется.
+        :raises TypeError: всегда.
+        """
+        raise TypeError("boom: a programming bug, not a source outage")
+
+
+async def test_bare_type_error_is_not_masked_as_auth_unavailable(
+    make_token: Callable[..., str],
+) -> None:
+    """Голый TypeError из бага в проверке не превращается в тихий 503.
+
+    Это зеркало поправки 2: там авария источника не должна была выглядеть
+    как плохой токен (401); здесь баг не должен выглядеть как авария (503).
+    Ожидание — исключение долетает до вызывающего кода необработанным
+    (в тестовом ASGI-клиенте это означает, что оно поднимается из самого
+    вызова `client.get`, а не приходит как HTTP-ответ).
+    """
+    application = FastAPI()
+    application.state.access_token_verifier = _BuggyVerifier()
+
+    @application.get("/me")
+    async def me(claims: AccessTokenClaims = Depends(get_claims)) -> dict[str, str]:
+        return {"sub": str(claims.sub)}
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        with pytest.raises(TypeError, match="boom"):
+            await client.get(
+                "/me",
+                headers={"Authorization": f"Bearer {make_token()}"},
+            )

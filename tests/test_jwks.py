@@ -1,10 +1,16 @@
 import asyncio
+import base64
 import json
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 
-from mestory_core.auth.jwks import JwksClient, UnknownSigningKeyError
+from mestory_core.auth.jwks import (
+    JwksClient,
+    MalformedJwksDocumentError,
+    UnknownSigningKeyError,
+)
 from tests.conftest import jwks_document
 
 JWKS_URL = "https://auth.test/api/auth/.well-known/jwks.json"
@@ -369,3 +375,41 @@ async def test_ttl_below_min_refetch_interval_is_rejected() -> None:
     async with httpx.AsyncClient() as http:
         with pytest.raises(ValueError, match="ttl"):
             JwksClient(JWKS_URL, http, ttl=1.0, min_refetch_interval=2.0)
+
+
+# --- Раунд правок 1 к задаче 9: сломанный документ — не голый TypeError. ---
+
+
+async def test_non_rsa_key_raises_malformed_document_error() -> None:
+    """Ключ не-RSA типа в документе JWKS — это порча документа, а не bug.
+
+    Раньше `_to_pem` поднимал голый `TypeError`, неотличимый от бага в
+    произвольном месте цепочки проверки токена. Выделенный тип нужен,
+    чтобы `dependencies.get_claims` мог узко ловить именно этот случай.
+    """
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    numbers = private_key.public_key().public_numbers()
+
+    def b64url(value: int) -> str:
+        raw = value.to_bytes(32, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    document = {
+        "keys": [
+            {
+                "kty": "EC",
+                "crv": "P-256",
+                "kid": "ec-kid",
+                "x": b64url(numbers.x),
+                "y": b64url(numbers.y),
+            },
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        with pytest.raises(MalformedJwksDocumentError):
+            await client.get_key("ec-kid")

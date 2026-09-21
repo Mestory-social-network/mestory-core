@@ -14,6 +14,16 @@ class UnknownSigningKeyError(Exception):
     """В документе JWKS нет ключа с запрошенным kid."""
 
 
+class MalformedJwksDocumentError(Exception):
+    """Документ JWKS получен, но содержит ключ, непригодный для проверки.
+
+    Отдельный тип нужен, чтобы `dependencies.get_claims` мог сузить перехват
+    до по-настоящему «не можем проверить» и не глотать заодно произвольный
+    `TypeError` из бага где-то в цепочке проверки токена — тот обязан
+    остаться громким 500, а не притвориться аварией источника ключей.
+    """
+
+
 class JwksClient:
     """Отдаёт публичные ключи по kid, держа документ JWKS в памяти.
 
@@ -83,7 +93,8 @@ class JwksClient:
             выходит новый экземпляр той же ошибки (тип и сообщение те же),
             а не один и тот же объект — иначе цепочка `__traceback__` росла
             бы без предела на протяжении всей аварии.
-        :raises TypeError: если ключ в документе JWKS не является RSA.
+        :raises MalformedJwksDocumentError: если ключ в документе JWKS не
+            является RSA либо иначе не может быть разобран.
         """
         if self._lock.locked() or self._should_attempt_fetch(kid):
             await self._attempt_fetch(kid)
@@ -244,13 +255,29 @@ def _to_pem(jwk: dict[str, Any]) -> str:
     """
     Преобразовать элемент JWKS в PEM публичного ключа.
 
+    Ключ приходит из документа, которому мы не доверяем: он мог быть не
+    RSA-ключом, либо иначе не разобраться тем способом, каким его пытается
+    прочитать `jwt.PyJWK`. Оба случая — порча самого документа, а не баг в
+    нашем коде, поэтому исходный `TypeError` не выходит наружу как есть, а
+    оборачивается в `MalformedJwksDocumentError` с сохранением причины через
+    `from`: вызывающий код (`dependencies.get_claims`) обязан узко ловить
+    именно «документ сломан», а не любой `TypeError` вообще — иначе он
+    заодно проглотил бы и настоящий программистский баг, случившийся где-то
+    дальше по цепочке проверки.
+
     :param jwk: один ключ из документа JWKS.
     :return: PEM публичного ключа.
-    :raises TypeError: если ключ не является RSA-ключом.
+    :raises MalformedJwksDocumentError: если ключ не является RSA-ключом
+        либо иначе не может быть разобран.
     """
-    key = jwt.PyJWK.from_dict(jwk).key
-    if not isinstance(key, RSAPublicKey):
-        raise TypeError(f"Only RSA keys are supported, got {type(key).__name__}.")
+    try:
+        key = jwt.PyJWK.from_dict(jwk).key
+        if not isinstance(key, RSAPublicKey):
+            raise TypeError(
+                f"Only RSA keys are supported, got {type(key).__name__}.",
+            )
+    except TypeError as exc:
+        raise MalformedJwksDocumentError(str(exc)) from exc
     return key.public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,

@@ -8,6 +8,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from mestory_core.auth.claims import AccessTokenClaims
+from mestory_core.auth.jwks import MalformedJwksDocumentError
 from mestory_core.auth.verifier import AccessTokenVerifier
 from mestory_core.errors import ProblemDetail
 from mestory_core.permissions import ROLE_ADMIN, Permission, permissions_for_roles
@@ -39,15 +40,22 @@ async def get_claims(
     обязано положить его туда в своём lifespan.
 
     Недоступность источника ключей (`httpx.HTTPError`) и повреждённый
-    документ JWKS (`TypeError` из разбора ключа) обрабатываются отдельной
-    веткой, идущей после `jwt.InvalidTokenError`: это не «токен плохой», а
-    «мы не можем это проверить», и раздача 401 в этом случае разлогинила бы
-    всех пользователей на время аварии `auth_service`, а 500 — скрыла бы
+    документ JWKS (`MalformedJwksDocumentError` — ключ не RSA либо иначе не
+    разобрать) обрабатываются отдельной веткой, идущей после
+    `jwt.InvalidTokenError`: это не «токен плохой», а «мы не можем это
+    проверить», и раздача 401 в этом случае разлогинила бы всех
+    пользователей на время аварии `auth_service`, а 500 — скрыла бы
     временный характер отказа от клиентов, которые могли бы повторить
     запрос. Ветка стоит после обработки `jwt.InvalidTokenError`, но не
-    перекрывает её: `httpx.HTTPError` и `TypeError` не являются подклассами
-    `jwt.InvalidTokenError`, поэтому уже обработанные случаи в неё не
-    попадают.
+    перекрывает её: ни `httpx.HTTPError`, ни `MalformedJwksDocumentError` не
+    являются подклассами `jwt.InvalidTokenError`, поэтому уже обработанные
+    случаи в неё не попадают.
+
+    Перехват нарочно не расширен до голого `TypeError`: тот прикрывал бы
+    всю цепочку `verifier.verify()`, включая `verify_access_token` и
+    `model_validate`, и превращал бы любой программистский баг где угодно
+    в этой цепочке в тихое «попробуйте позже» вместо громкого 500, который
+    кто-нибудь заметит и починит.
 
     :param request: текущий запрос.
     :param credentials: разобранный заголовок Authorization.
@@ -62,7 +70,16 @@ async def get_claims(
             "Authorization header with a Bearer token is required.",
         )
 
-    verifier: AccessTokenVerifier = request.app.state.access_token_verifier
+    verifier: AccessTokenVerifier | None = getattr(
+        request.app.state,
+        "access_token_verifier",
+        None,
+    )
+    if verifier is None:
+        raise RuntimeError(
+            "app.state.access_token_verifier is not set; the application "
+            "must configure it in its lifespan before serving requests.",
+        )
     try:
         return await verifier.verify(credentials.credentials)
     except jwt.InvalidTokenError as exc:
@@ -71,7 +88,7 @@ async def get_claims(
             "invalid_token",
             str(exc),
         ) from exc
-    except (httpx.HTTPError, TypeError) as exc:
+    except (httpx.HTTPError, MalformedJwksDocumentError) as exc:
         raise _problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "auth_unavailable",
