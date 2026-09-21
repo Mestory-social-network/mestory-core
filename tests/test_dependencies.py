@@ -399,3 +399,41 @@ async def test_bare_type_error_is_not_masked_as_auth_unavailable(
                 "/me",
                 headers={"Authorization": f"Bearer {make_token()}"},
             )
+
+
+# --- Раунд правок 2: не всякий сломанный документ даёт TypeError — PyJWT
+# сам поднимает jwt.InvalidKeyError/jwt.PyJWKError для нечитаемых ключей. ---
+
+
+async def test_unparseable_jwks_key_is_still_503_not_500(
+    make_token: Callable[..., str],
+) -> None:
+    """Ключ без kty (не разобрать вовсе) даёт 503 auth_unavailable, не 500.
+
+    `jwt.PyJWK.from_dict` в этом случае поднимает `jwt.InvalidKeyError`, а
+    не `TypeError` — до этого раунда `_to_pem` ловил только `TypeError`, и
+    такой документ проходил бы мимо MalformedJwksDocumentError прямиком в
+    необработанный 500.
+    """
+    document = {
+        "keys": [
+            {
+                # Нет "kty" — jwt.PyJWK.from_dict бросает InvalidKeyError
+                # раньше, чем успевает дойти до проверки типа ключа.
+                "kid": "test-kid",
+                "use": "sig",
+            },
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with _client_for(handler) as client:
+        response = await client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {make_token()}"},
+        )
+
+    assert response.status_code == httpx.codes.SERVICE_UNAVAILABLE
+    assert response.json()["detail"]["code"] == "auth_unavailable"

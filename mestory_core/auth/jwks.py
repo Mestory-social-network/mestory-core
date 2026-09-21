@@ -255,15 +255,29 @@ def _to_pem(jwk: dict[str, Any]) -> str:
     """
     Преобразовать элемент JWKS в PEM публичного ключа.
 
-    Ключ приходит из документа, которому мы не доверяем: он мог быть не
-    RSA-ключом, либо иначе не разобраться тем способом, каким его пытается
-    прочитать `jwt.PyJWK`. Оба случая — порча самого документа, а не баг в
-    нашем коде, поэтому исходный `TypeError` не выходит наружу как есть, а
-    оборачивается в `MalformedJwksDocumentError` с сохранением причины через
-    `from`: вызывающий код (`dependencies.get_claims`) обязан узко ловить
-    именно «документ сломан», а не любой `TypeError` вообще — иначе он
-    заодно проглотил бы и настоящий программистский баг, случившийся где-то
-    дальше по цепочке проверки.
+    Ключ приходит из документа, которому мы не доверяем, и разобрать его
+    может не получиться по-разному:
+
+    - `jwt.PyJWK.from_dict` бросает `jwt.InvalidKeyError` (наследует
+      `jwt.PyJWTError` напрямую, а не `jwt.PyJWKError`, — проверено
+      экспериментально на PyJWT 2.14.0) для отсутствующего или
+      неподдерживаемого `kty`/`crv` и для битого материала ключа
+      (например, `n` с некорректным base64url);
+    - тот же `from_dict` бросает `jwt.PyJWKError` напрямую, если для
+      ключа не нашёлся алгоритм, и `jwt.MissingCryptographyError`
+      (подкласс `jwt.PyJWKError`), если для алгоритма не хватает
+      экстра-зависимости `cryptography` — оба задокументированы в
+      докстринге `jwt.PyJWK.__init__`;
+    - ключ, который `from_dict` разобрал успешно, но не RSA, детектируется
+      уже здесь и раньше поднимался как голый `TypeError`.
+
+    Все эти случаи — порча самого документа, а не баг в нашем коде, поэтому
+    ни один из исходных типов не выходит наружу как есть: все оборачиваются
+    в `MalformedJwksDocumentError` с сохранением причины через `from`.
+    Вызывающий код (`dependencies.get_claims`) обязан узко ловить именно
+    «документ сломан», а не любой `TypeError` или `jwt.PyJWTError` вообще —
+    иначе он заодно проглотил бы и настоящий программистский баг,
+    случившийся где-то дальше по цепочке проверки токена.
 
     :param jwk: один ключ из документа JWKS.
     :return: PEM публичного ключа.
@@ -276,7 +290,7 @@ def _to_pem(jwk: dict[str, Any]) -> str:
             raise TypeError(
                 f"Only RSA keys are supported, got {type(key).__name__}.",
             )
-    except TypeError as exc:
+    except (TypeError, jwt.InvalidKeyError, jwt.PyJWKError) as exc:
         raise MalformedJwksDocumentError(str(exc)) from exc
     return key.public_bytes(
         encoding=serialization.Encoding.PEM,
