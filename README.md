@@ -23,7 +23,9 @@ uv add git+https://github.com/Mestory-social-network/mestory-core@v0.1.0
 | `mestory_core.auth.jwks` | `JwksClient`, `UnknownSigningKeyError`, `MalformedJwksDocumentError` |
 | `mestory_core.auth.verifier` | `AccessTokenVerifier` |
 | `mestory_core.auth.dependencies` | `get_claims`, `require_roles`, `require_permissions` |
-| `mestory_core.events` | `RoutingKey`, `EXCHANGE_NAME`, схемы событий, `EVENTS_BY_ROUTING_KEY`, `EventPublisher`, `LoggingEventPublisher`, `RabbitEventPublisher` |
+| `mestory_core.events.keys` | `RoutingKey`, `EXCHANGE_NAME` |
+| `mestory_core.events.schemas` | классы событий (`UserRegistered`, `ProfileCreated`, …), `EVENTS_BY_ROUTING_KEY` |
+| `mestory_core.events.publisher` | `EventPublisher`, `LoggingEventPublisher`, `RabbitEventPublisher` |
 
 ## Как подключить авторизацию в сервисе
 
