@@ -352,6 +352,36 @@ async def test_malformed_jwks_document_is_still_503(
     assert response.json()["detail"]["code"] == "auth_unavailable"
 
 
+# --- Финальное ревью: M7 — RFC 6750 требует WWW-Authenticate на 401 от
+# ресурса, защищённого bearer-токеном. ---
+
+
+async def test_missing_header_401_carries_www_authenticate(
+    client: httpx.AsyncClient,
+) -> None:
+    """Запрос без заголовка — 401 c `WWW-Authenticate: Bearer`."""
+    async with client:
+        response = await client.get("/me")
+
+    assert response.status_code == httpx.codes.UNAUTHORIZED
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+async def test_invalid_token_401_carries_www_authenticate(
+    client: httpx.AsyncClient,
+    make_token: Callable[..., str],
+) -> None:
+    """Неприемлемый токен — тоже 401 c `WWW-Authenticate: Bearer`."""
+    async with client:
+        response = await client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {make_token(kid='forged')}"},
+        )
+
+    assert response.status_code == httpx.codes.UNAUTHORIZED
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
 class _BuggyVerifier:
     """Заглушка верификатора, эмулирующая программистский баг в цепочке.
 

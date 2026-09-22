@@ -16,17 +16,48 @@ from mestory_core.permissions import ROLE_ADMIN, Permission, permissions_for_rol
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def _problem(status_code: int, code: str, detail: str) -> HTTPException:
+def _problem(
+    status_code: int,
+    code: str,
+    detail: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> HTTPException:
     """
     Собрать HTTPException с телом в формате ProblemDetail.
 
     :param status_code: код ответа.
     :param code: машиночитаемый код ошибки.
     :param detail: человекочитаемое описание.
+    :param headers: дополнительные заголовки ответа.
     :return: готовое исключение.
     """
     body = ProblemDetail(code=code, detail=detail)
-    return HTTPException(status_code=status_code, detail=body.model_dump())
+    return HTTPException(
+        status_code=status_code,
+        detail=body.model_dump(),
+        headers=headers,
+    )
+
+
+def _unauthorized(code: str, detail: str) -> HTTPException:
+    """
+    Собрать 401 с заголовком, которого требует RFC 6750.
+
+    Ресурс, защищённый bearer-токеном, обязан отвечать на 401
+    `WWW-Authenticate: Bearer` — без него клиент не может отличить
+    "нет токена"/"токен не принят" от произвольной другой причины 401.
+
+    :param code: машиночитаемый код ошибки.
+    :param detail: человекочитаемое описание.
+    :return: готовое исключение с заголовком `WWW-Authenticate`.
+    """
+    return _problem(
+        status.HTTP_401_UNAUTHORIZED,
+        code,
+        detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def get_claims(
@@ -64,8 +95,7 @@ async def get_claims(
         503, если источник ключей недоступен или его документ повреждён.
     """
     if credentials is None:
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
+        raise _unauthorized(
             "not_authenticated",
             "Authorization header with a Bearer token is required.",
         )
@@ -83,8 +113,7 @@ async def get_claims(
     try:
         return await verifier.verify(credentials.credentials)
     except jwt.InvalidTokenError as exc:
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
+        raise _unauthorized(
             "invalid_token",
             str(exc),
         ) from exc

@@ -100,6 +100,32 @@ def test_is_superuser_is_read_when_present(
     assert claims.is_superuser is True
 
 
+def test_unknown_claim_is_ignored_not_rejected(
+    key_pair: tuple[str, str],
+    make_token: Callable[..., str],
+) -> None:
+    """Claim, которого модель не знает, не валит токен.
+
+    Регрессия для отложенного пункта 15: `extra="ignore"` в
+    `AccessTokenClaims` — платформенный инвариант (`auth_service` обязан
+    мочь добавить новый claim и выкатить его раньше, чем эта библиотека
+    научится его понимать, не обрывая 401 уже живые сессии), а не просто
+    унаследованное по умолчанию поведение pydantic. Явное объявление нужно
+    покрыть тестом, а не полагаться на то, что дефолт фреймворка не
+    поменяется.
+    """
+    _, public_pem = key_pair
+
+    claims = verify_access_token(
+        make_token(future_claim_from_auth_service="not modelled yet"),
+        public_pem,
+        audience=AUDIENCE,
+        issuer=ISSUER,
+    )
+
+    assert not hasattr(claims, "future_claim_from_auth_service")
+
+
 def test_refresh_token_type_is_rejected(
     key_pair: tuple[str, str],
     make_token: Callable[..., str],
@@ -187,6 +213,34 @@ def test_broken_is_verified_field_is_rejected_as_invalid_token(
         )
 
 
+def test_broken_claim_error_message_does_not_leak_pydantic_internals(
+    key_pair: tuple[str, str],
+    make_token: Callable[..., str],
+) -> None:
+    """Сообщение об ошибке — фиксированная строка, а не текст pydantic.
+
+    Регрессия для M3: `ValidationError` pydantic несёт имена внутренних
+    полей модели, эхо присланных значений и ссылки на
+    errors.pydantic.dev — ни то, ни другое не должно попасть в текст
+    исключения, который `dependencies.get_claims` кладёт прямиком в тело
+    публичного 401-ответа.
+    """
+    _, public_pem = key_pair
+
+    with pytest.raises(jwt.InvalidTokenError) as excinfo:
+        verify_access_token(
+            make_token(is_verified="не bool"),
+            public_pem,
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+
+    message = str(excinfo.value)
+    assert message == "Token claims failed validation."
+    assert "is_verified" not in message
+    assert "pydantic.dev" not in message
+
+
 def test_hs256_signed_token_is_rejected(key_pair: tuple[str, str]) -> None:
     """Токен, подписанный HS256 с публичным PEM в роли HMAC-секрета, не проходит.
 
@@ -234,7 +288,9 @@ def test_alg_none_token_is_rejected(key_pair: tuple[str, str]) -> None:
         "iat": issued_at,
         "exp": issued_at + timedelta(minutes=15),
     }
-    unsigned = jwt.encode(payload, key=None, algorithm="none")
+    # Стаб PyJWT не допускает key=None в сигнатуре, хотя alg "none" именно
+    # этого и требует во время выполнения.
+    unsigned = jwt.encode(payload, key=None, algorithm="none")  # type: ignore[arg-type]
 
     with pytest.raises(jwt.InvalidTokenError):
         verify_access_token(
@@ -249,8 +305,8 @@ def test_remaining_seconds_is_never_negative() -> None:
     """У истёкшего токена остаток равен нулю, а не отрицательному числу."""
     past = int((datetime.now(UTC) - timedelta(hours=1)).timestamp())
     claims = AccessTokenClaims(
-        sub="00000000-0000-0000-0000-000000000001",
-        jti="00000000-0000-0000-0000-000000000002",
+        sub=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        jti=uuid.UUID("00000000-0000-0000-0000-000000000002"),
         roles=["user"],
         is_verified=True,
         iat=past,
