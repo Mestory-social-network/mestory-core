@@ -263,7 +263,8 @@ class JwksClient:
             ошибкой.
         :raises MalformedJwksDocumentError: если тело не парсится как JSON,
             либо распарсенный документ не имеет ожидаемой формы (не объект,
-            `keys` — не список, элемент `keys` — не объект).
+            `keys` отсутствует, не список или пуст, элемент `keys` — не
+            объект).
         """
         response = await self._http.get(self._url)
         response.raise_for_status()
@@ -282,11 +283,29 @@ class JwksClient:
                 f"JWKS document at {self._url} must be a JSON object, got "
                 f"{type(document).__name__}.",
             )
-        raw_keys = document.get("keys", [])
+        # Отсутствующее поле 'keys' и пустой список — тоже испорченный
+        # документ, а не «ключей пока нет». Раньше `document.get("keys",
+        # [])` тихо подставлял [] и на отсутствующее поле, и на пустой
+        # список — self._keys ниже оставался пустым, и следующий кэш-промах
+        # отвечал UnknownSigningKeyError вместо честного «документ не
+        # годится». Различие важно: непустой документ с генуинно
+        # отсутствующим kid обязан остаться 401 (см.
+        # `test_unknown_kid_with_warm_cache_raises_unknown_key_not_source_error`),
+        # а документ, который в принципе не может отдать ни одного ключа —
+        # это авария источника (503), а не решение проверяющего.
+        if "keys" not in document:
+            raise MalformedJwksDocumentError(
+                f"JWKS document at {self._url} is missing the 'keys' field.",
+            )
+        raw_keys = document["keys"]
         if not isinstance(raw_keys, list):
             raise MalformedJwksDocumentError(
                 f"JWKS document at {self._url}: field 'keys' must be a "
                 f"list, got {type(raw_keys).__name__}.",
+            )
+        if not raw_keys:
+            raise MalformedJwksDocumentError(
+                f"JWKS document at {self._url}: field 'keys' is empty.",
             )
         for entry in raw_keys:
             if not isinstance(entry, dict):

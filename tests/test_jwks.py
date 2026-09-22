@@ -625,3 +625,34 @@ async def test_stale_cache_fallback_logs_a_warning(
     assert len(caplog.records) == 1
     assert caplog.records[0].levelno == logging.WARNING
     assert "stale cache" in caplog.records[0].getMessage()
+
+
+# --- Дефект 2: документ без пригодных ключей маскировался под пустой JWKS. ---
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        pytest.param(json.dumps({"hello": "world"}).encode(), id="no_keys_field"),
+        pytest.param(json.dumps({"keys": []}).encode(), id="empty_keys_list"),
+    ],
+)
+async def test_document_with_no_usable_keys_raises_malformed_error(
+    raw_body: bytes,
+) -> None:
+    """Документ без единого потенциально пригодного ключа — не пустой JWKS.
+
+    До фикса `document.get("keys", [])` подставлял `[]` и на отсутствующее
+    поле, и на пустой список: `self._keys` оставался пустым словарём, и
+    следующий же запрос получал `UnknownSigningKeyError` — 401 для всех, —
+    хотя источник фактически не смог отдать пригодный документ и это
+    честная авария (503), а не решение проверяющего кода.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw_body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        with pytest.raises(MalformedJwksDocumentError):
+            await client.get_key("any-kid")

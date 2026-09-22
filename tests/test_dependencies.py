@@ -352,6 +352,73 @@ async def test_malformed_jwks_document_is_still_503(
     assert response.json()["detail"]["code"] == "auth_unavailable"
 
 
+# --- Дефект 2: документ без пригодных ключей отвечает 401 всем вместо 503. ---
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        pytest.param(json.dumps({"hello": "world"}).encode(), id="no_keys_field"),
+        pytest.param(json.dumps({"keys": []}).encode(), id="empty_keys_list"),
+    ],
+)
+async def test_document_with_no_usable_keys_is_503_not_401(
+    raw_body: bytes,
+    make_token: Callable[..., str],
+) -> None:
+    """Документ без ключей (поле отсутствует или пустой список) — 503, не 401.
+
+    До фикса такой документ проходил как «загруженный и пустой», и
+    следующий запрос с любым, даже валидно подписанным токеном получал
+    401 — хотя источник ключей фактически не смог отдать ничего пригодного
+    и это авария, а не решение о токене.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw_body)
+
+    async with _client_for(handler) as client:
+        response = await client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {make_token()}"},
+        )
+
+    assert response.status_code == httpx.codes.SERVICE_UNAVAILABLE
+    assert response.json()["detail"]["code"] == "auth_unavailable"
+
+
+async def test_warm_cache_with_genuinely_unknown_kid_is_still_401(
+    make_token: Callable[..., str],
+    key_pair: tuple[str, str],
+) -> None:
+    """Непустой тёплый кэш с реально отсутствующим kid остаётся 401, не 503.
+
+    Дефект 2 сужает "keys отсутствует/пуст" до 503 — важно, что это не
+    задевает легитимный случай: документ пригоден, ключей в нём хватает,
+    просто не для ЭТОГО kid. Таксономия обязана различать эти два случая.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="test-kid")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with _client_for(handler) as client:
+        warm = await client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {make_token(kid='test-kid')}"},
+        )
+        assert warm.status_code == httpx.codes.OK
+
+        response = await client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {make_token(kid='forged')}"},
+        )
+
+    assert response.status_code == httpx.codes.UNAUTHORIZED
+    assert response.json()["detail"]["code"] == "invalid_token"
+
+
 # --- Финальное ревью: M7 — RFC 6750 требует WWW-Authenticate на 401 от
 # ресурса, защищённого bearer-токеном. ---
 
