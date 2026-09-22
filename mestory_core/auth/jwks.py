@@ -80,25 +80,71 @@ class JwksClient:
         """
         Вернуть публичный ключ в PEM по его kid.
 
+        Порядок внутри метода намеренно такой: (1) свежий кэш — раньше
+        любого обращения к блокировке; (2) блокировка и загрузка, только
+        если кэш сам ответить не может; (3) откат на устаревший, но
+        непустой для этого kid кэш, если загрузка не удалась; (4)
+        классификация неудачи, только если и кэш, и загрузка не дали
+        ответа. Требование (1) защищает горячий путь от паразитной
+        задержки: без него запрос с уже закэшированным kid ждал бы
+        завершения чужой загрузки (например, вызванной шквалом токенов с
+        мусорным kid) наравне с тем, кто её вызвал. Требование (3) не даёт
+        аварии источника проваливать запросы, которые устаревший (но
+        почти наверняка ещё валидный — RS256-ключи живут неделями) кэш мог
+        обслужить сам.
+
         :param kid: идентификатор ключа из заголовка токена.
         :return: PEM публичного ключа.
         :raises UnknownSigningKeyError: если документ загружен, непуст, но
             ключа с таким kid в нём нет.
-        :raises httpx.HTTPError: если получить документ не удалось — этой
-            попыткой или последней, чья ошибка ещё не сброшена успешной
-            загрузкой (при этом кэш пуст, а окно троттлинга не позволяет
-            попробовать снова прямо сейчас). Это не «неизвестный kid»: без
-            разделения источник, лежащий во время аварии, разлогинил бы
-            всех пользователей вместо честного 503. Наружу каждый раз
-            выходит новый экземпляр той же ошибки (тип и сообщение те же),
-            а не один и тот же объект — иначе цепочка `__traceback__` росла
-            бы без предела на протяжении всей аварии.
-        :raises MalformedJwksDocumentError: если ключ в документе JWKS не
-            является RSA либо иначе не может быть разобран.
+        :raises httpx.HTTPError: если получить документ не удалось и кэш не
+            может ответить на этот kid — ни свежим, ни устаревшим
+            значением. Наружу каждый раз выходит новый экземпляр той же
+            ошибки (тип и сообщение те же), а не один и тот же объект —
+            иначе цепочка `__traceback__` росла бы без предела на
+            протяжении всей аварии.
+        :raises MalformedJwksDocumentError: если документ JWKS не парсится
+            как JSON, имеет не ту форму, либо содержит ключ, который не
+            является RSA или иначе не может быть разобран — и кэш не может
+            ответить на этот kid ни свежим, ни устаревшим значением.
         """
-        if self._lock.locked() or self._should_attempt_fetch(kid):
-            await self._attempt_fetch(kid)
+        # 1. Свежий кэш — первым делом и до блокировки. Кэш общий на весь
+        #    документ (одна отметка `_fetched_at`), а не по kid, поэтому
+        #    "свежий" здесь значит "документ не устарел по TTL". Обращение
+        #    к `self._lock` (даже просто `.locked()`) для уже отвечаемого из
+        #    кэша запроса — лишнее: конкурентная загрузка ради ЧУЖОГО kid не
+        #    должна задерживать запрос, чей ключ уже под рукой (см. тест
+        #    `test_cached_lookup_is_not_delayed_by_an_unrelated_in_flight_fetch`).
+        key = self._keys.get(kid)
+        if key is not None and not self._is_stale():
+            return key
 
+        # 2. Блокировка и загрузка — только если кэш не может ответить сам:
+        #    kid неизвестен, либо документ устарел. Присоединяемся к уже
+        #    идущей загрузке (`self._lock.locked()`) или начинаем свою.
+        if self._lock.locked() or self._should_attempt_fetch(kid):
+            try:
+                await self._attempt_fetch(kid)
+            except Exception:
+                # 3. Откат на устаревший кэш. Загрузка не удалась, но если
+                #    кэш (пусть и просроченный по TTL) уже содержит именно
+                #    этот kid — обслуживаем запрос им, а не проваливаем его.
+                #    RS256-ключи живут неделями: просроченный по TTL кэш
+                #    почти наверняка всё ещё валиден, и падать здесь значит
+                #    защищать источник ключей ценой чужого запроса, который
+                #    кэш мог обслужить сам (см.
+                #    `test_stale_cache_survives_a_failed_refresh`).
+                #    Если же и это не спасает — перевыбрасываем как есть:
+                #    именно эта ветка (а не перезаписанный `self._last_error`)
+                #    даёт первому в аварии вызову «сырую» ошибку без
+                #    искусственного пересоздания, как и раньше.
+                key = self._keys.get(kid)
+                if key is not None:
+                    return key
+                raise
+
+        # 4. Классификация неудачи — только когда кэш действительно не может
+        #    ответить: ни свежим, ни устаревшим значением для этого kid.
         key = self._keys.get(kid)
         if key is not None:
             return key
@@ -185,16 +231,54 @@ class JwksClient:
         """
         Загрузить документ JWKS и заменить им кэш.
 
+        Источнику не доверяем: прокси, вернувший 200 с HTML-страницей
+        ошибки, обрезанным телом или структурно неверным JSON — обычный
+        случай, а не экзотика. Без проверки формы такие ответы всплывали бы
+        голыми `json.JSONDecodeError`/`TypeError`/`AttributeError` из
+        глубины словарного включения ниже, `get_claims` не смог бы отличить
+        их от программистского бага (см. `MalformedJwksDocumentError`) и
+        сервис отвечал бы 500 вместо честного 503 — да ещё и на всё окно
+        троттлинга: сломанный ответ оседает в `_last_error` точно так же,
+        как реальная сетевая авария.
+
         :raises httpx.HTTPError: если запрос не удался или сервер ответил
             ошибкой.
+        :raises MalformedJwksDocumentError: если тело не парсится как JSON,
+            либо распарсенный документ не имеет ожидаемой формы (не объект,
+            `keys` — не список, элемент `keys` — не объект).
         """
         response = await self._http.get(self._url)
         response.raise_for_status()
-        document: dict[str, Any] = response.json()
+        try:
+            document: Any = response.json()
+        except ValueError as exc:
+            # response.json() поднимает json.JSONDecodeError — подкласс
+            # ValueError — на нечитаемом как JSON теле (обрезанном,
+            # HTML-странице ошибки и т.п.).
+            raise MalformedJwksDocumentError(
+                f"JWKS document at {self._url} is not valid JSON: {exc}",
+            ) from exc
+
+        if not isinstance(document, dict):
+            raise MalformedJwksDocumentError(
+                f"JWKS document at {self._url} must be a JSON object, got "
+                f"{type(document).__name__}.",
+            )
+        raw_keys = document.get("keys", [])
+        if not isinstance(raw_keys, list):
+            raise MalformedJwksDocumentError(
+                f"JWKS document at {self._url}: field 'keys' must be a "
+                f"list, got {type(raw_keys).__name__}.",
+            )
+        for entry in raw_keys:
+            if not isinstance(entry, dict):
+                raise MalformedJwksDocumentError(
+                    f"JWKS document at {self._url}: entry in 'keys' must "
+                    f"be an object, got {type(entry).__name__}.",
+                )
+
         self._keys = {
-            jwk["kid"]: _to_pem(jwk)
-            for jwk in document.get("keys", [])
-            if "kid" in jwk
+            jwk["kid"]: _to_pem(jwk) for jwk in raw_keys if "kid" in jwk
         }
         self._fetched_at = time.monotonic()
 

@@ -413,3 +413,138 @@ async def test_non_rsa_key_raises_malformed_document_error() -> None:
         client = JwksClient(JWKS_URL, http)
         with pytest.raises(MalformedJwksDocumentError):
             await client.get_key("ec-kid")
+
+
+# --- Раунд правок к финальному ревью: I1/I2/I3 — всё это порядок операций
+# внутри get_key, а не таксономия исключений (та пятью раундами раньше уже
+# закрыта). ---
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        pytest.param(b"<html>502 Bad Gateway</html>", id="html_error_page"),
+        pytest.param(b'{"keys": [', id="truncated_json"),
+        pytest.param(
+            json.dumps({"keys": [1, 2]}).encode(),
+            id="keys_entries_not_objects",
+        ),
+        pytest.param(
+            json.dumps({"keys": ["kid-ish"]}).encode(),
+            id="keys_entries_are_strings",
+        ),
+        pytest.param(json.dumps({"keys": None}).encode(), id="keys_is_null"),
+        pytest.param(
+            json.dumps([{"kid": "top-level-list"}]).encode(),
+            id="document_is_a_list",
+        ),
+    ],
+)
+async def test_malformed_jwks_document_raises_malformed_error_not_a_builtin(
+    raw_body: bytes,
+) -> None:
+    """Ответ 200 с испорченным телом — это MalformedJwksDocumentError, не 500.
+
+    Регрессия для I1: раньше форма документа не проверялась, только форма
+    отдельного ключа внутри него. Прокси, отдающий 200 с HTML-страницей
+    ошибки — обычный случай, а не экзотика — раньше всплывал голым
+    `json.JSONDecodeError`/`TypeError`/`AttributeError`, который
+    `dependencies.get_claims` не перехватывает узко (и не должен: это
+    молча замаскировало бы настоящий программистский баг), и сервис отвечал
+    500 вместо честного 503 — причём на всё окно троттлинга, потому что
+    сломанный ответ оседает в `_last_error` точно так же, как настоящая
+    сетевая авария.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw_body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http)
+        with pytest.raises(MalformedJwksDocumentError):
+            await client.get_key("any-kid")
+
+
+async def test_stale_cache_survives_a_failed_refresh(
+    key_pair: tuple[str, str],
+) -> None:
+    """Провалившийся рефетч не должен ронять запрос, который кэш ещё может обслужить.
+
+    Регрессия для I2: TTL для RS256 — это гигиена, а не граница
+    безопасности, ключи живут неделями. Запрос с kid, который устаревший (по
+    TTL) кэш всё ещё знает, не должен получать 503 только потому, что именно
+    в этот момент источник недоступен — устаревшая, но почти наверняка ещё
+    валидная запись обязана его обслужить.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="test-kid")
+    calls: list[httpx.Request] = []
+    expected_calls = 2  # прогрев + один провалившийся рефетч, без исключения
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, content=json.dumps(document))
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http, ttl=0.05, min_refetch_interval=0.0)
+        warm_pem = await client.get_key("test-kid")
+
+        await asyncio.sleep(0.1)  # TTL истёк, источник теперь мёртв
+
+        stale_pem = await client.get_key("test-kid")
+
+    assert stale_pem == warm_pem
+    assert len(calls) == expected_calls
+
+
+async def test_cached_lookup_is_not_delayed_by_an_unrelated_in_flight_fetch(
+    key_pair: tuple[str, str],
+) -> None:
+    """Свежий кэш отвечает сразу, даже пока идёт загрузка ради чужого kid.
+
+    Регрессия для I3: раньше единственным условием попытки войти в секцию
+    блокировки было "блокировка занята ИЛИ пора обновиться" — без проверки,
+    что кэш прямо сейчас уже отвечает на ЭТОТ kid. Шквал мусорных kid,
+    поймавший конец окна троттлинга, запускал настоящую (и в проде — до 5с,
+    таймаут httpx по умолчанию) загрузку, и любой другой конкурентный
+    вызов — даже за давно закэшированным и свежим ключом — дожидался её
+    целиком. Троттлинг, защищающий auth_service, превращался в усилитель
+    задержки на потребителе, управляемый неаутентифицированным атакующим.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="known-kid")
+    release_fetch = asyncio.Event()
+    fetch_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        fetch_started.set()
+        await release_fetch.wait()
+        return httpx.Response(200, content=json.dumps(document))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http, min_refetch_interval=0.0)
+
+        # Прогрев: кэш свежий и знает "known-kid" после этого вызова.
+        release_fetch.set()
+        await client.get_key("known-kid")
+        release_fetch.clear()
+        fetch_started.clear()
+
+        # Мусорный kid запускает настоящую загрузку, которая зависает.
+        stuck = asyncio.create_task(client.get_key("garbage-kid"))
+        await fetch_started.wait()  # дождаться, пока загрузка реально пойдёт по сети
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        cached_pem = await asyncio.wait_for(client.get_key("known-kid"), timeout=1.0)
+        elapsed = loop.time() - start
+
+        release_fetch.set()  # отпустить зависшую загрузку
+        with pytest.raises(UnknownSigningKeyError):
+            await stuck
+
+    max_elapsed_without_waiting = 0.2  # щедрый запас; зависшая загрузка не отпустится
+    assert cached_pem.startswith("-----BEGIN PUBLIC KEY-----")
+    assert elapsed < max_elapsed_without_waiting
