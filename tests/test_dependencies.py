@@ -135,6 +135,27 @@ async def test_unknown_kid_is_401(
     assert response.json()["detail"]["code"] == "invalid_token"
 
 
+async def test_unknown_kid_401_does_not_leak_jwks_url(
+    client: httpx.AsyncClient,
+    make_token: Callable[..., str],
+) -> None:
+    """Тело 401 за неизвестный kid не содержит внутренний адрес JWKS.
+
+    До фикса `UnknownSigningKeyError` включало `self._url` в сообщение, и
+    оно долетало без изменений до тела 401, которое видит
+    неаутентифицированный вызывающий — например, "No key 'forged' in JWKS
+    at https://auth.test/api/auth/.well-known/jwks.json".
+    """
+    async with client:
+        response = await client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {make_token(kid='forged')}"},
+        )
+
+    assert response.status_code == httpx.codes.UNAUTHORIZED
+    assert JWKS_URL not in response.text
+
+
 async def test_missing_role_is_403(
     client: httpx.AsyncClient,
     make_token: Callable[..., str],

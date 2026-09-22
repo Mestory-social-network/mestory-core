@@ -656,3 +656,26 @@ async def test_document_with_no_usable_keys_raises_malformed_error(
         client = JwksClient(JWKS_URL, http)
         with pytest.raises(MalformedJwksDocumentError):
             await client.get_key("any-kid")
+
+
+# --- Дефект 3: сообщение UnknownSigningKeyError раскрывало адрес JWKS. ---
+
+
+async def test_unknown_kid_message_does_not_leak_jwks_url(
+    jwks_transport: tuple[httpx.MockTransport, list[httpx.Request]],
+) -> None:
+    """Сообщение об неизвестном kid не содержит внутренний адрес JWKS.
+
+    До фикса сообщение включало `self._url` напрямую, и оно долетало без
+    изменений до тела 401, которое видит неаутентифицированный клиент —
+    тот же класс утечки, что уже был закрыт для деталей pydantic в
+    `claims.py`.
+    """
+    transport, _ = jwks_transport
+
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = JwksClient(JWKS_URL, http)
+        with pytest.raises(UnknownSigningKeyError) as exc_info:
+            await client.get_key("nope")
+
+    assert JWKS_URL not in str(exc_info.value)

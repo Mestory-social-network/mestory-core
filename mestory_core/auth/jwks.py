@@ -170,7 +170,7 @@ class JwksClient:
         if self._keys:
             # Документ свежий (или ещё не устарел) и непустой — просто нет
             # такого kid. Ключи у нас есть, этот не наш.
-            raise UnknownSigningKeyError(f"No key {kid!r} in JWKS at {self._url}.")
+            raise self._unknown_signing_key(kid)
 
         # Кэш пуст. Если это из-за недавнего сбоя загрузки — это авария
         # источника, а не «неизвестный ключ», и наружу должна выйти именно
@@ -179,7 +179,25 @@ class JwksClient:
         # внутри окна отката удлинял бы traceback того же самого объекта.
         if self._last_error is not None:
             raise _respawn(self._last_error) from self._last_error
-        raise UnknownSigningKeyError(f"No key {kid!r} in JWKS at {self._url}.")
+        raise self._unknown_signing_key(kid)
+
+    def _unknown_signing_key(self, kid: str) -> UnknownSigningKeyError:
+        """
+        Собрать `UnknownSigningKeyError` для kid, которого нет в документе.
+
+        Сообщение исключения долетает до вызывающего кода без изменений
+        (`AccessTokenVerifier.verify` заворачивает его в
+        `jwt.InvalidTokenError`, `get_claims` кладёт `str(exc)` прямо в
+        тело 401) — тот же класс утечки, что уже был закрыт в
+        `claims.py` для деталей pydantic. Адрес JWKS полезен для
+        диагностики, но не для неаутентифицированного клиента, поэтому он
+        остаётся только в логе.
+
+        :param kid: идентификатор ключа, которого нет в документе.
+        :return: готовое исключение с сообщением, безопасным для 401.
+        """
+        logger.info("No key %r in JWKS document at %s.", kid, self._url)
+        return UnknownSigningKeyError(f"No signing key found for kid {kid!r}.")
 
     def _should_attempt_fetch(self, kid: str) -> bool:
         """
