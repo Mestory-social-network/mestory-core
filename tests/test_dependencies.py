@@ -381,18 +381,37 @@ async def test_malformed_jwks_document_is_still_503(
     [
         pytest.param(json.dumps({"hello": "world"}).encode(), id="no_keys_field"),
         pytest.param(json.dumps({"keys": []}).encode(), id="empty_keys_list"),
+        pytest.param(
+            json.dumps(
+                {
+                    "keys": [
+                        {
+                            "kty": "RSA",
+                            "use": "sig",
+                            "alg": "RS256",
+                            "n": "AQAB",
+                            "e": "AQAB",
+                        },
+                    ],
+                },
+            ).encode(),
+            id="no_entry_has_a_kid",
+        ),
     ],
 )
 async def test_document_with_no_usable_keys_is_503_not_401(
     raw_body: bytes,
     make_token: Callable[..., str],
 ) -> None:
-    """Документ без ключей (поле отсутствует или пустой список) — 503, не 401.
+    """Документ без ключей (поле отсутствует, пустой список, или без kid) — 503.
 
     До фикса такой документ проходил как «загруженный и пустой», и
     следующий запрос с любым, даже валидно подписанным токеном получал
     401 — хотя источник ключей фактически не смог отдать ничего пригодного
-    и это авария, а не решение о токене.
+    и это авария, а не решение о токене. Третий параметр — документ, где
+    'keys' непуст, но ни одна запись не несёт 'kid': разбор фильтром `if
+    "kid" in jwk` тоже оставлял кэш пустым, только незаметно для самого
+    этого запроса — падал следующий, не связанный с загрузкой.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:

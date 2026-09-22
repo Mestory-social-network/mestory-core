@@ -280,9 +280,11 @@ class JwksClient:
         :raises httpx.HTTPError: если запрос не удался или сервер ответил
             ошибкой.
         :raises MalformedJwksDocumentError: если тело не парсится как JSON,
-            либо распарсенный документ не имеет ожидаемой формы (не объект,
-            `keys` отсутствует, не список или пуст, элемент `keys` — не
-            объект).
+            распарсенный документ не имеет ожидаемой формы (не объект,
+            `keys` — не список, элемент `keys` — не объект), либо документ
+            структурно валиден, но не даёт ни одного ключа, пригодного для
+            проверки (`keys` отсутствует, пуст, или ни один элемент не
+            несёт `kid`).
         """
         response = await self._http.get(self._url)
         response.raise_for_status()
@@ -301,29 +303,14 @@ class JwksClient:
                 f"JWKS document at {self._url} must be a JSON object, got "
                 f"{type(document).__name__}.",
             )
-        # Отсутствующее поле 'keys' и пустой список — тоже испорченный
-        # документ, а не «ключей пока нет». Раньше `document.get("keys",
-        # [])` тихо подставлял [] и на отсутствующее поле, и на пустой
-        # список — self._keys ниже оставался пустым, и следующий кэш-промах
-        # отвечал UnknownSigningKeyError вместо честного «документ не
-        # годится». Различие важно: непустой документ с генуинно
-        # отсутствующим kid обязан остаться 401 (см.
-        # `test_unknown_kid_with_warm_cache_raises_unknown_key_not_source_error`),
-        # а документ, который в принципе не может отдать ни одного ключа —
-        # это авария источника (503), а не решение проверяющего.
-        if "keys" not in document:
-            raise MalformedJwksDocumentError(
-                f"JWKS document at {self._url} is missing the 'keys' field.",
-            )
-        raw_keys = document["keys"]
+        # `document.get("keys", [])` подставляет [] и на отсутствующее поле,
+        # и (будучи уже списком) не трогает пустой список — обе формы дальше
+        # обрабатывает одна и та же проверка ниже, а не два отдельных raise.
+        raw_keys = document.get("keys", [])
         if not isinstance(raw_keys, list):
             raise MalformedJwksDocumentError(
                 f"JWKS document at {self._url}: field 'keys' must be a "
                 f"list, got {type(raw_keys).__name__}.",
-            )
-        if not raw_keys:
-            raise MalformedJwksDocumentError(
-                f"JWKS document at {self._url}: field 'keys' is empty.",
             )
         for entry in raw_keys:
             if not isinstance(entry, dict):
@@ -332,9 +319,36 @@ class JwksClient:
                     f"be an object, got {type(entry).__name__}.",
                 )
 
-        self._keys = {
+        # Собираем в локальную переменную, а не прямо в self._keys: провал
+        # проверки ниже не должен стирать ещё годный кэш от предыдущей
+        # успешной загрузки (см. откат на устаревший кэш в get_key) —
+        # неудачная попытка обязана оставить состояние клиента как было,
+        # точно так же, как и все проверки формы выше.
+        parsed_keys = {
             jwk["kid"]: _to_pem(jwk) for jwk in raw_keys if "kid" in jwk
         }
+        # Единая точка «документ не дал ни одного пригодного ключа» —
+        # раньше это были три места (отсутствующее поле 'keys', пустой
+        # список, и — до этого фикса — молча отфильтрованные записи без
+        # kid), с одной и той же причиной и одним и тем же исходом
+        # (self._keys пуст), но разной судьбой: первые два были заранее
+        # закрыты явным raise, третий — нет, потому что сам не выглядел как
+        # пустой документ, пока не разваливался следующий, не связанный с
+        # ним запрос. Теперь причина одна, и здесь же единственная проверка
+        # для всех её форм. Различие, которое обязано остаться: НЕПУСТОЙ
+        # кэш с генуинно отсутствующим kid — это по-прежнему
+        # `UnknownSigningKeyError` (401), а не эта ветка — проверка ниже
+        # смотрит на результат ЭТОЙ загрузки, а не на итоговый self._keys
+        # после отката на устаревший кэш (см.
+        # `test_unknown_kid_with_warm_cache_raises_unknown_key_not_source_error`).
+        if not parsed_keys:
+            raise MalformedJwksDocumentError(
+                f"JWKS document at {self._url} yielded no usable signing "
+                f"keys: 'keys' is missing, empty, or none of its entries "
+                f"carry a 'kid'.",
+            )
+
+        self._keys = parsed_keys
         self._fetched_at = time.monotonic()
 
 

@@ -635,6 +635,22 @@ async def test_stale_cache_fallback_logs_a_warning(
     [
         pytest.param(json.dumps({"hello": "world"}).encode(), id="no_keys_field"),
         pytest.param(json.dumps({"keys": []}).encode(), id="empty_keys_list"),
+        pytest.param(
+            json.dumps(
+                {
+                    "keys": [
+                        {
+                            "kty": "RSA",
+                            "use": "sig",
+                            "alg": "RS256",
+                            "n": "AQAB",
+                            "e": "AQAB",
+                        },
+                    ],
+                },
+            ).encode(),
+            id="no_entry_has_a_kid",
+        ),
     ],
 )
 async def test_document_with_no_usable_keys_raises_malformed_error(
@@ -647,6 +663,14 @@ async def test_document_with_no_usable_keys_raises_malformed_error(
     следующий же запрос получал `UnknownSigningKeyError` — 401 для всех, —
     хотя источник фактически не смог отдать пригодный документ и это
     честная авария (503), а не решение проверяющего кода.
+
+    Третий параметр — тот же класс дефекта с другой формой: документ,
+    структурно валидный и с непустым 'keys', но где ни одна запись не несёт
+    'kid'. Разбор в `_fetch` строит `self._keys` фильтром `if "kid" in
+    jwk` — такой документ тоже даёт пустой кэш, только скрыто: сам по себе
+    он не выглядит пустым, и следующий, вообще не связанный с этой загрузкой
+    запрос получал бы `UnknownSigningKeyError` (401 всем), а не честную
+    503-аварию источника.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
