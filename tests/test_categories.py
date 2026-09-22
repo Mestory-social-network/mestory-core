@@ -17,4 +17,7 @@ def test_categories_cover_the_mvp_board() -> None:
 
 def test_category_is_a_string() -> None:
     """Категория сериализуется как строка — она едет в JSON и в БД."""
-    assert Category.COFFEE == "coffee"
+    # mypy считает Literal[Category.COFFEE] и Literal["coffee"] непересекающимися
+    # типами, хотя во время выполнения StrEnum делает их равными, — это и
+    # проверяется здесь.
+    assert Category.COFFEE == "coffee"  # type: ignore[comparison-overlap]

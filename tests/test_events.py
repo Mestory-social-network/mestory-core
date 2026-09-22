@@ -2,9 +2,12 @@ import json
 import logging
 import uuid
 from types import TracebackType
+from typing import cast
 
 import aio_pika
 import pytest
+from aio_pika import Channel
+from aio_pika.pool import Pool
 
 from mestory_core.events.keys import EXCHANGE_NAME, RoutingKey
 from mestory_core.events.publisher import LoggingEventPublisher, RabbitEventPublisher
@@ -249,7 +252,10 @@ def rabbit_publisher(fake_exchange: _FakeExchange) -> RabbitEventPublisher:
     """
     channel = _FakeChannel(fake_exchange)
     pool = _FakeChannelPool(channel)
-    return RabbitEventPublisher(pool)
+    # _FakeChannelPool — минимальная структурная замена Pool[Channel] (только
+    # acquire()), не его подкласс; cast сообщает mypy то, что тест уже
+    # проверяет поведением.
+    return RabbitEventPublisher(cast(Pool[Channel], pool))
 
 
 async def test_rabbit_publisher_declares_a_durable_topic_exchange(

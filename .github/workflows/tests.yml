@@ -13,7 +13,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          python-version-file: ".python-version"
       - run: uv sync --locked
       - run: uv run ruff check .
-      - run: uv run mypy mestory_core
+      - run: uv run mypy mestory_core tests
       - run: uv run pytest -vv
