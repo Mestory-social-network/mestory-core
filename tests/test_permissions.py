@@ -55,3 +55,17 @@ def test_permissions_are_the_union_of_roles() -> None:
 def test_empty_or_unknown_role_lists_grant_nothing(roles: list[str]) -> None:
     """Пустой и полностью неизвестный список одинаково не дают прав."""
     assert permissions_for_roles(roles) == frozenset()
+
+
+def test_known_role_mixed_with_unknown_grants_exactly_the_known_share() -> None:
+    """Неизвестное имя рядом с известным не отбирает и не добавляет прав.
+
+    Пропущенный до сих пор случай: покрыт был только список из одних
+    неизвестных ролей и список из одних известных, но не их смесь.
+    `["user", "ghost"]` обязан давать ровно то же самое, что и `["user"]`
+    один — иначе "неизвестное имя не значит ничего" было бы проверено лишь
+    наполовину.
+    """
+    assert permissions_for_roles([ROLE_USER, "ghost"]) == permissions_for_roles(
+        [ROLE_USER],
+    )

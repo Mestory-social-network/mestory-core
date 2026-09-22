@@ -184,6 +184,12 @@ def _all_event_types(base: type[Event]) -> list[type[Event]]:
 # Единый источник правды для потребителя: получив из AMQP routing_key и
 # сырое тело, он находит здесь класс и валидирует тело через
 # model_validate_json — той же моделью, которой издатель его собрал.
+#
+# `_all_event_types(Event)` детерминирован, только пока эта строка стоит
+# НИЖЕ всех подклассов Event в этом модуле: `__subclasses__()` видит лишь то,
+# что уже определено (импортировано) на момент вызова. Подкласс `Event`,
+# заведённый потребителем в собственном модуле, в этой карте не появится
+# молча — если только тот модуль не был импортирован до этой строки.
 EVENTS_BY_ROUTING_KEY: dict[RoutingKey, type[Event]] = {
     event_type.routing_key: event_type for event_type in _all_event_types(Event)
 }

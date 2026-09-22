@@ -18,7 +18,7 @@ uv add git+https://github.com/Mestory-social-network/mestory-core@v0.1.2
 `mestory_core/__init__.py` обязаны совпадать с тегом, который на них
 указывает, — иначе README инструктирует ставить версию, отличную от той,
 что описывает. Поэтому выпуск версии — один коммит, а не тег на
-случайный:
+случайный коммит:
 
 1. В одном коммите обновить все три места сразу: строку установки в этом
    README, `version` в `pyproject.toml`, `__version__` в
@@ -43,6 +43,20 @@ uv add git+https://github.com/Mestory-social-network/mestory-core@v0.1.2
 | `mestory_core.events.publisher` | `EventPublisher`, `LoggingEventPublisher`, `RabbitEventPublisher` |
 
 ## Как подключить авторизацию в сервисе
+
+Три значения, которые должен получить каждый потребитель, задаёт
+`auth_service` (см. `auth_service/settings.py` и его роутер) — ошибиться
+здесь означает не сломаться шумно: неверная аудитория отклоняет 401 каждый
+токен, но тратит на диагностику вечер:
+
+| Настройка | Значение |
+|---|---|
+| `settings.jwks_url` | `http://<хост auth_service>/api/auth/.well-known/jwks.json` |
+| `settings.jwt_audience` | `mestory:api` |
+| `settings.jwt_issuer` | `mestory-auth` |
+
+Внутри сети `mestory` (см. README `mestory-infra`, раздел «Подключения
+изнутри сети») это `http://mestory-traefik/api/auth/.well-known/jwks.json`.
 
 В lifespan приложения:
 

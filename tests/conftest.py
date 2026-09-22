@@ -12,7 +12,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 
-AUDIENCE = "mestory"
+# Реальные значения auth_service (auth_service/settings.py): расхождение
+# здесь означало бы, что тесты проверяют не ту аудиторию/издателя, которые
+# сервисы получают в проде, и не заметили бы неверную настройку.
+AUDIENCE = "mestory:api"
 ISSUER = "mestory-auth"
 
 
