@@ -1,6 +1,7 @@
 """Асинхронный клиент JWKS с кэшем ключей по kid."""
 
 import asyncio
+import logging
 import time
 from typing import Any
 
@@ -8,6 +9,8 @@ import httpx
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownSigningKeyError(Exception):
@@ -125,21 +128,36 @@ class JwksClient:
         if self._lock.locked() or self._should_attempt_fetch(kid):
             try:
                 await self._attempt_fetch(kid)
-            except Exception:
-                # 3. Откат на устаревший кэш. Загрузка не удалась, но если
-                #    кэш (пусть и просроченный по TTL) уже содержит именно
-                #    этот kid — обслуживаем запрос им, а не проваливаем его.
+            except (httpx.HTTPError, MalformedJwksDocumentError) as exc:
+                # 3. Откат на устаревший кэш — но только для двух исходов,
+                #    которые на самом деле значат «не смогли получить
+                #    пригодный документ»: сеть/сервер (`httpx.HTTPError`) и
+                #    контракт документа (`MalformedJwksDocumentError`). Кэш
+                #    (пусть и просроченный по TTL) уже содержит именно этот
+                #    kid — обслуживаем запрос им, а не проваливаем его.
                 #    RS256-ключи живут неделями: просроченный по TTL кэш
                 #    почти наверняка всё ещё валиден, и падать здесь значит
                 #    защищать источник ключей ценой чужого запроса, который
                 #    кэш мог обслужить сам (см.
                 #    `test_stale_cache_survives_a_failed_refresh`).
-                #    Если же и это не спасает — перевыбрасываем как есть:
+                #    Любой другой exception (программистский баг где-то в
+                #    цепочке `_fetch`/`_to_pem`) обязан пройти сквозь эту
+                #    ветку необработанным — иначе тёплый кэш маскировал бы
+                #    его точно так же тихо, как и настоящую аварию (см.
+                #    `test_bug_in_parse_path_propagates_even_with_warm_cache`).
+                #    Если и стейл-кэш не спасает — перевыбрасываем как есть:
                 #    именно эта ветка (а не перезаписанный `self._last_error`)
                 #    даёт первому в аварии вызову «сырую» ошибку без
                 #    искусственного пересоздания, как и раньше.
                 key = self._keys.get(kid)
                 if key is not None:
+                    logger.warning(
+                        "JWKS refresh failed (%s: %s); serving kid %r from "
+                        "stale cache.",
+                        type(exc).__name__,
+                        exc,
+                        kid,
+                    )
                     return key
                 raise
 

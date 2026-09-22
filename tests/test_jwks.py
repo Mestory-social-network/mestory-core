@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import json
+import logging
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 
+import mestory_core.auth.jwks as jwks_module
 from mestory_core.auth.jwks import (
     JwksClient,
     MalformedJwksDocumentError,
@@ -548,3 +550,78 @@ async def test_cached_lookup_is_not_delayed_by_an_unrelated_in_flight_fetch(
     max_elapsed_without_waiting = 0.2  # щедрый запас; зависшая загрузка не отпустится
     assert cached_pem.startswith("-----BEGIN PUBLIC KEY-----")
     assert elapsed < max_elapsed_without_waiting
+
+
+# --- Дефект 1: `except Exception` в откате на устаревший кэш глотал баги. ---
+
+
+async def test_bug_in_parse_path_propagates_even_with_warm_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    key_pair: tuple[str, str],
+) -> None:
+    """Баг в цепочке fetch/parse не должен тонуть в тёплом кэше.
+
+    Регрессия: `except Exception` в откате на устаревший кэш ловил вообще
+    всё, включая `AttributeError` из бага где-то в `_to_pem` — так что
+    сам баг не долетал до вызывающего кода ни разу, пока кэш ещё мог
+    ответить сам. Итог до фикса: три подряд 200 из устаревшего кэша,
+    ключ никогда больше не подхватывает ротацию, и ни строчки в логе.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="test-kid")
+    calls: list[httpx.Request] = []
+    expected_calls = 2  # прогрев + один рефетч, где и сработал баг
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, content=json.dumps(document))
+
+    def buggy_to_pem(jwk: dict[str, object]) -> str:
+        raise AttributeError("boom: a bug in _to_pem, not a source outage")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http, ttl=0.05, min_refetch_interval=0.0)
+        await client.get_key("test-kid")  # прогрев: кэш тёплый
+
+        await asyncio.sleep(0.1)  # TTL истёк — следующий вызов рефетчит
+
+        monkeypatch.setattr(jwks_module, "_to_pem", buggy_to_pem)
+
+        with pytest.raises(AttributeError, match="boom"):
+            await client.get_key("test-kid")
+
+    assert len(calls) == expected_calls
+
+
+async def test_stale_cache_fallback_logs_a_warning(
+    caplog: pytest.LogCaptureFixture,
+    key_pair: tuple[str, str],
+) -> None:
+    """Обслуживание из устаревшего кэша во время настоящей аварии — в логе.
+
+    До фикса откат на устаревший кэш проходил абсолютно молча: ни разу
+    ничего не логировалось и не поднималось, пока источник ключей лежал.
+    """
+    _, public_pem = key_pair
+    document = jwks_document(public_pem, kid="test-kid")
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, content=json.dumps(document))
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = JwksClient(JWKS_URL, http, ttl=0.05, min_refetch_interval=0.0)
+        warm_pem = await client.get_key("test-kid")
+
+        await asyncio.sleep(0.1)  # TTL истёк, источник теперь мёртв
+
+        with caplog.at_level(logging.WARNING, logger="mestory_core.auth.jwks"):
+            stale_pem = await client.get_key("test-kid")
+
+    assert stale_pem == warm_pem
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "stale cache" in caplog.records[0].getMessage()
