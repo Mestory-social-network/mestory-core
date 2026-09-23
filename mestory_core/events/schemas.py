@@ -97,12 +97,16 @@ class ProfileUpdated(Event):
     """Изменено отображаемое имя или аватар.
 
     Нужно тем, кто держит денормализованную копию карточки автора — в первую
-    очередь ленте.
+    очередь ленте. Несёт оба идентификатора: `user_id` — тот, под которым
+    человек известен всем сервисам (это `sub` его токена, и денормализованная
+    копия лежит именно под ним), `profile_id` — внутренний ключ
+    `profile_service`, полезный только для сверки с его логами.
     """
 
     routing_key: ClassVar[RoutingKey] = RoutingKey.PROFILE_UPDATED
 
     profile_id: uuid.UUID
+    user_id: uuid.UUID
     display_name: str
     avatar_media_id: uuid.UUID | None = None
 
@@ -113,6 +117,7 @@ class ProfileBusinessVerified(Event):
     routing_key: ClassVar[RoutingKey] = RoutingKey.PROFILE_BUSINESS_VERIFIED
 
     profile_id: uuid.UUID
+    user_id: uuid.UUID
 
 
 class ProfileFollowed(Event):

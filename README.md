@@ -6,7 +6,7 @@
 ## Подключение
 
 ```bash
-uv add git+https://github.com/Mestory-social-network/mestory-core@v0.1.5
+uv add git+https://github.com/Mestory-social-network/mestory-core@v0.1.6
 ```
 
 Версия пинуется тегом всегда. Ломающее изменение схемы события — мажорная

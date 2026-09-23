@@ -14,7 +14,12 @@ from mestory_core.events.publisher import LoggingEventPublisher, RabbitEventPubl
 from mestory_core.events.schemas import (
     EVENTS_BY_ROUTING_KEY,
     Event,
+    ProfileBlocked,
+    ProfileBusinessVerified,
     ProfileFollowed,
+    ProfileUnblocked,
+    ProfileUnfollowed,
+    ProfileUpdated,
     UserDeleted,
     UserRegistered,
 )
@@ -120,6 +125,85 @@ def test_event_round_trips_through_its_mapped_class() -> None:
     restored = event_type.model_validate_json(body)
 
     assert restored == event
+
+
+def test_profile_updated_carries_the_cross_service_identifier() -> None:
+    """Consumers know a person by user_id, not profile_id.
+
+    The token's `sub` claim is user_id, and that's the key under which a
+    denormalised author card is held. An event carrying only this
+    service's own profile_id would not tell such a consumer what to
+    update.
+    """
+    profile_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    event = ProfileUpdated(
+        profile_id=profile_id,
+        user_id=user_id,
+        display_name="Leonid",
+    )
+
+    assert event.user_id == user_id
+    assert event.profile_id == profile_id
+
+
+def test_profile_business_verified_carries_the_cross_service_identifier() -> None:
+    """Whoever reacts to a verified business knows it by user_id.
+
+    Same reason as above.
+    """
+    user_id = uuid.uuid4()
+
+    event = ProfileBusinessVerified(profile_id=uuid.uuid4(), user_id=user_id)
+
+    assert event.user_id == user_id
+
+
+def test_every_single_subject_profile_event_carries_user_id() -> None:
+    """Событие, описывающее один профиль, обязано нести его `user_id`.
+
+    Признак «описывает один профиль» — наличие `profile_id`. Такое событие
+    адресовано тому, кто держит денормализованную копию карточки автора, а
+    ищет он её по `user_id`: это `sub` токена, единственный идентификатор,
+    который есть у любого сервиса без запросов куда-либо.
+
+    Проверка идёт по карте `EVENTS_BY_ROUTING_KEY`, а не по списку классов,
+    чтобы следующее добавленное событие с `profile_id` не смогло обойти
+    правило молча.
+    """
+    single_subject = [
+        event_type
+        for key, event_type in EVENTS_BY_ROUTING_KEY.items()
+        if key.value.startswith("profile.") and "profile_id" in event_type.model_fields
+    ]
+
+    assert single_subject, "expected the map to contain single-subject events"
+    missing = [
+        event_type.__name__
+        for event_type in single_subject
+        if "user_id" not in event_type.model_fields
+    ]
+    assert missing == []
+
+
+def test_relational_profile_events_name_both_sides_by_role() -> None:
+    """У реляционного события субъект не один, а пара.
+
+    Безличное `user_id` в нём было бы неоднозначным — непонятно, чей. Этот
+    тест фиксирует, что исключение таких событий из правила выше осознанное,
+    а не дырка в нём.
+    """
+    expected: dict[type[Event], set[str]] = {
+        ProfileFollowed: {"follower_id", "followee_id"},
+        ProfileUnfollowed: {"follower_id", "followee_id"},
+        ProfileBlocked: {"blocker_id", "blocked_id"},
+        ProfileUnblocked: {"blocker_id", "blocked_id"},
+    }
+
+    for event_type, fields in expected.items():
+        assert fields <= set(event_type.model_fields), event_type.__name__
+        assert "user_id" not in event_type.model_fields, event_type.__name__
 
 
 class _FakeExchange:
