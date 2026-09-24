@@ -142,10 +142,47 @@ def test_profile_updated_carries_the_cross_service_identifier() -> None:
         profile_id=profile_id,
         user_id=user_id,
         display_name="Leonid",
+        account_type="creator",
     )
 
     assert event.user_id == user_id
     assert event.profile_id == profile_id
+
+
+def test_profile_updated_carries_the_account_type() -> None:
+    """Тип аккаунта есть на карточке профиля, значит он должен доезжать.
+
+    `ProfileCard` в `profile_service` отдаёт `account_type`, то есть у
+    потребителя, держащего денормализованную копию карточки, это поле есть.
+    Без него в событии смена типа не доехала бы до соседей никогда, и переход
+    `user → creator`, который разрешает публиковать рекомендации, остался бы
+    для сервиса публикаций невидимым.
+    """
+    event = ProfileUpdated(
+        profile_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        display_name="Leonid",
+        account_type="creator",
+    )
+
+    assert event.account_type == "creator"
+
+
+def test_the_author_card_fields_of_profile_updated_are_all_required() -> None:
+    """Карточка автора описывается событием целиком, а не частично.
+
+    `display_name` и `account_type` обязательны: потребитель перезаписывает
+    свою копию карточки по этому событию, и необязательное поле означало бы
+    «не знаю, чему оно равно» — то есть копию пришлось бы обновлять
+    частично, угадывая, отсутствие это или изменение.
+    """
+    required = {
+        name
+        for name, field in ProfileUpdated.model_fields.items()
+        if field.is_required()
+    }
+
+    assert {"profile_id", "user_id", "display_name", "account_type"} <= required
 
 
 def test_profile_business_verified_carries_the_cross_service_identifier() -> None:

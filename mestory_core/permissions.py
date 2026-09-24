@@ -26,6 +26,7 @@ class Permission(enum.StrEnum):
     USER_UPDATE_ANY = "user:update:any"
     USER_DELETE_ANY = "user:delete:any"
     ROLE_ASSIGN = "role:assign"
+    PROFILE_VERIFY_BUSINESS = "profile:verify:business"
 
 
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
@@ -38,6 +39,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.USER_UPDATE_SELF,
             Permission.USER_READ_ANY,
             Permission.USER_UPDATE_ANY,
+            Permission.PROFILE_VERIFY_BUSINESS,
         },
     ),
     ROLE_ADMIN: frozenset(Permission),

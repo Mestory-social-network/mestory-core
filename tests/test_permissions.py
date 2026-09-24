@@ -69,3 +69,46 @@ def test_known_role_mixed_with_unknown_grants_exactly_the_known_share() -> None:
     assert permissions_for_roles([ROLE_USER, "ghost"]) == permissions_for_roles(
         [ROLE_USER],
     )
+
+
+def test_moderator_can_verify_a_business_but_a_user_cannot() -> None:
+    """Проверка бизнес-заявки — работа модератора, и право на неё живёт здесь.
+
+    В `profile_service` это проверяется зависимостью `require_permissions`,
+    которая выводит права из ролей в токене, — значит имя права обязано быть
+    в общем словаре, иначе у одной строки станет два источника правды.
+    """
+    assert Permission.PROFILE_VERIFY_BUSINESS in permissions_for_roles(
+        [ROLE_MODERATOR],
+    )
+    assert Permission.PROFILE_VERIFY_BUSINESS not in permissions_for_roles(
+        [ROLE_USER],
+    )
+
+
+def test_admin_gets_every_permission_including_the_new_one() -> None:
+    """У админа права не перечисляются, а берутся целиком из enum.
+
+    Тест держит это свойство: добавленное право не должно требовать правки
+    списка админа — иначе однажды его туда забудут внести.
+    """
+    assert permissions_for_roles([ROLE_ADMIN]) == frozenset(Permission)
+
+
+def test_every_permission_name_follows_the_agreed_shape() -> None:
+    """Имя права — `домен:действие` или `домен:действие:область`.
+
+    Решение о формате записано как закрытое, и без проверки оно держится
+    только на внимательности того, кто добавляет следующее право.
+
+    Область необязательна, и это не послабление ради прохождения теста:
+    `role:assign` существует с самого начала и области не имеет, потому что
+    назначать роли можно только кому угодно — сужать там нечего, и
+    `role:assign:any` был бы словом ради симметрии. Проверка всё равно ловит
+    то, ради чего написана: пустой сегмент, верхний регистр, отсутствие
+    двоеточия вовсе, лишний четвёртый сегмент.
+    """
+    for permission in Permission:
+        parts = permission.value.split(":")
+        assert len(parts) in {2, 3}, permission.value
+        assert all(part and part.islower() for part in parts), permission.value
