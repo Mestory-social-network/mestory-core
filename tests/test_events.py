@@ -10,7 +10,11 @@ from aio_pika import Channel
 from aio_pika.pool import Pool
 
 from mestory_core.events.keys import EXCHANGE_NAME, RoutingKey
-from mestory_core.events.publisher import LoggingEventPublisher, RabbitEventPublisher
+from mestory_core.events.publisher import (
+    EchoingEventPublisher,
+    LoggingEventPublisher,
+    RabbitEventPublisher,
+)
 from mestory_core.events.schemas import (
     EVENTS_BY_ROUTING_KEY,
     Event,
@@ -434,3 +438,72 @@ async def test_rabbit_publisher_round_trips_the_event_body(
     message, routing_key = fake_exchange.published[0]
     event_type = EVENTS_BY_ROUTING_KEY[RoutingKey(routing_key)]
     assert event_type.model_validate_json(message.body) == event
+
+
+class _RecordingPublisher:
+    """Публикатор, который запоминает вызовы и умеет отказывать."""
+
+    def __init__(self, *, fails: bool = False) -> None:
+        self.events: list[Event] = []
+        self.fails = fails
+
+    async def publish(self, event: Event) -> None:
+        """
+        Записать вызов, затем при необходимости отказать.
+
+        :param event: событие.
+        :raises RuntimeError: если публикатор настроен на отказ.
+        """
+        self.events.append(event)
+        if self.fails:
+            raise RuntimeError("брокер недоступен")
+
+
+async def test_echoing_publisher_delivers_and_writes_to_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Обе половины смысла обёртки: доставка и читаемый токен."""
+    inner = _RecordingPublisher()
+    event = UserRegistered(user_id=uuid.uuid4(), email="a@example.com")
+
+    with caplog.at_level(logging.INFO):
+        await EchoingEventPublisher(inner).publish(event)
+
+    assert inner.events == [event]
+    assert RoutingKey.USER_REGISTERED.value in caplog.text
+    assert "a@example.com" in caplog.text
+
+
+async def test_echoing_publisher_writes_nothing_when_delivery_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Строка в логе означает «доставлено», и не должна лгать.
+
+    Её читают именно так. Запись, сделанная до неудачной публикации, сказала
+    бы читателю неправду ровно в тот момент, когда он разбирает аварию, —
+    поэтому доставка идёт первой, а лог только после неё.
+    """
+    inner = _RecordingPublisher(fails=True)
+    event = UserRegistered(user_id=uuid.uuid4(), email="a@example.com")
+
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError):
+        await EchoingEventPublisher(inner).publish(event)
+
+    assert caplog.text == ""
+
+
+async def test_echoing_publisher_lets_the_failure_through(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Проглоченная здесь ошибка пометила бы недоставленное доставленным.
+
+    Воркер outbox в auth_service считает успешный `publish()` доставкой и
+    помечает строку отправленной. Обёртка, скрывшая отказ брокера, потеряла
+    бы событие безвозвратно — строку никто больше не возьмёт.
+    """
+    inner = _RecordingPublisher(fails=True)
+
+    with pytest.raises(RuntimeError, match="брокер недоступен"):
+        await EchoingEventPublisher(inner).publish(
+            UserRegistered(user_id=uuid.uuid4(), email="a@example.com"),
+        )
