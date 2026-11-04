@@ -259,9 +259,7 @@ class JwksClient:
 
         :return: True, если окно троттлинга истекло.
         """
-        return (
-            time.monotonic() - self._last_attempt_at
-        ) >= self._min_refetch_interval
+        return (time.monotonic() - self._last_attempt_at) >= self._min_refetch_interval
 
     async def _fetch(self) -> None:
         """
@@ -324,9 +322,7 @@ class JwksClient:
         # успешной загрузки (см. откат на устаревший кэш в get_key) —
         # неудачная попытка обязана оставить состояние клиента как было,
         # точно так же, как и все проверки формы выше.
-        parsed_keys = {
-            jwk["kid"]: _to_pem(jwk) for jwk in raw_keys if "kid" in jwk
-        }
+        parsed_keys = {jwk["kid"]: _to_pem(jwk) for jwk in raw_keys if "kid" in jwk}
         # Единая точка «документ не дал ни одного пригодного ключа» —
         # раньше это были три места (отсутствующее поле 'keys', пустой
         # список, и — до этого фикса — молча отфильтрованные записи без
