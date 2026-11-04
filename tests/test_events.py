@@ -254,6 +254,8 @@ class _FakeExchange:
         """Завести пустую историю объявления и публикаций."""
         self.declare_kwargs: dict[str, object] = {}
         self.published: list[tuple[aio_pika.Message, str]] = []
+        #: Сколько следующих публикаций должны отказать.
+        self.failures_left = 0
 
     async def publish(self, message: aio_pika.Message, routing_key: str) -> None:
         """
@@ -261,7 +263,12 @@ class _FakeExchange:
 
         :param message: публикуемое сообщение AMQP.
         :param routing_key: ключ маршрутизации публикации.
+        :raises RuntimeError: если тест попросил отказ, как это сделал бы
+            брокер на удалённом exchange или закрытом канале.
         """
+        if self.failures_left:
+            self.failures_left -= 1
+            raise RuntimeError("exchange is gone")
         self.published.append((message, routing_key))
 
 
@@ -275,6 +282,28 @@ class _FakeChannel:
         :param exchange: фиктивный exchange.
         """
         self._exchange = exchange
+        #: Сколько раз на этом канале объявляли exchange.
+        self.declare_calls = 0
+        #: Сколько раз exchange брали без объявления.
+        self.get_calls = 0
+
+    async def get_exchange(self, name: str, *, ensure: bool) -> _FakeExchange:
+        """
+        Отдать exchange, ничего не объявляя.
+
+        :param name: имя exchange.
+        :param ensure: должен быть False — иначе aio_pika сходил бы к
+            брокеру с пассивным объявлением, то есть ровно за тем обходом,
+            которого здесь и избегают.
+        :return: фиктивный exchange.
+        :raises AssertionError: если запрошена проверка у брокера.
+        """
+        assert ensure is False, (
+            "get_exchange(ensure=True) talks to the broker, which defeats the "
+            "point of not declaring again"
+        )
+        self.get_calls += 1
+        return self._exchange
 
     async def declare_exchange(
         self,
@@ -293,6 +322,7 @@ class _FakeChannel:
         :param auto_delete: удаляется ли exchange без слушателей.
         :return: фиктивный exchange.
         """
+        self.declare_calls += 1
         self._exchange.declare_kwargs = {
             "name": name,
             "type": type,
@@ -365,6 +395,20 @@ def fake_exchange() -> _FakeExchange:
     :return: фиктивный exchange.
     """
     return _FakeExchange()
+
+
+@pytest.fixture
+def fake_channel(fake_exchange: _FakeExchange) -> _FakeChannel:
+    """
+    Дать фиктивный канал, считающий объявления.
+
+    Тот же объект, что получит публикатор: пул отдаёт его при каждом
+    `acquire()`, как настоящий пул из одного канала.
+
+    :param fake_exchange: фиктивный exchange, который канал отдаёт.
+    :return: фиктивный канал.
+    """
+    return _FakeChannel(fake_exchange)
 
 
 @pytest.fixture
@@ -507,3 +551,71 @@ async def test_echoing_publisher_lets_the_failure_through(
         await EchoingEventPublisher(inner).publish(
             UserRegistered(user_id=uuid.uuid4(), email="a@example.com"),
         )
+
+
+async def test_the_exchange_is_declared_once_per_channel(
+    fake_channel: _FakeChannel,
+) -> None:
+    """Объявление стояло на каждой публикации — это лишний обход брокера.
+
+    `declare_exchange` — это кадр `Exchange.Declare` и ожидание
+    `Declare-Ok`, то есть полный обмен с брокером. Публикации идут из
+    воркера outbox по строке за раз, так что каждое событие платформы
+    стоило двух обходов вместо одного.
+
+    Наивно закэшировать объект exchange нельзя: он привязан к каналу, а
+    каналы приходят из пула. Поэтому помнится не объект, а факт объявления
+    на этом канале, а дальше `get_exchange(ensure=False)` собирает объект
+    локально, не разговаривая с брокером.
+
+    Три публикации на одном канале: одно объявление и два взятия без него.
+    Пул постоянный и маленький, так что после прогрева лишних обходов не
+    остаётся ни одного.
+    """
+    publishes = 3
+    publisher = RabbitEventPublisher(
+        cast(Pool[Channel], _FakeChannelPool(fake_channel)),
+    )
+
+    for _ in range(publishes):
+        await publisher.publish(UserDeleted(user_id=uuid.uuid4()))
+
+    assert fake_channel.declare_calls == 1, (
+        f"the exchange was declared {fake_channel.declare_calls} times for "
+        f"{publishes} publishes on one channel"
+    )
+    assert fake_channel.get_calls == publishes - 1
+
+
+async def test_a_failed_publish_makes_the_next_one_declare_again(
+    fake_channel: _FakeChannel,
+    fake_exchange: _FakeExchange,
+) -> None:
+    """Помнить объявление можно только пока публикации удаются.
+
+    Exchange durable и живёт на сервере дольше любого нашего канала, так
+    что повторное объявление ничего бы не меняло — кроме одного случая:
+    exchange удалили снаружи. Тогда публикация в него отказывает, и это
+    единственный признак, по которому видно, что память устарела.
+
+    Поэтому неудачная публикация забывает канал. Повтор есть у обоих
+    вызывающих — воркер outbox перечитает строку, — и он объявит exchange
+    заново, то есть восстановление происходит само, без отдельного пути.
+    """
+    publisher = RabbitEventPublisher(
+        cast(Pool[Channel], _FakeChannelPool(fake_channel)),
+    )
+    await publisher.publish(UserDeleted(user_id=uuid.uuid4()))
+    assert fake_channel.declare_calls == 1
+
+    fake_exchange.failures_left = 1
+    with pytest.raises(RuntimeError):
+        await publisher.publish(UserDeleted(user_id=uuid.uuid4()))
+
+    await publisher.publish(UserDeleted(user_id=uuid.uuid4()))
+
+    declares_expected = 2
+    assert fake_channel.declare_calls == declares_expected, (
+        "the channel was not forgotten after the failure: the next publish "
+        "reused an exchange already known to be unusable"
+    )
