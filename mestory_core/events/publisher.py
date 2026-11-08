@@ -1,10 +1,12 @@
 """Публикация событий."""
 
 import logging
+import weakref
 from typing import Protocol
 
 import aio_pika
 from aio_pika import Channel
+from aio_pika.abc import AbstractExchange
 from aio_pika.pool import Pool
 
 from mestory_core.events.keys import EXCHANGE_NAME
@@ -68,6 +70,51 @@ class RabbitEventPublisher:
         """
         self.channel_pool = channel_pool
         self.exchange_name = exchange_name
+        #: Каналы, на которых exchange уже объявлен в этом процессе.
+        #:
+        #: Слабые ссылки, потому что каналы принадлежат пулу: держать их
+        #: сильной ссылкой значило бы не дать закрытому каналу уйти.
+        #: Канал хешируется по тождеству — своих `__eq__` и `__hash__` у
+        #: него нет, проверено, — так что множество говорит именно «вот
+        #: этот объект канала», а не «какой-то похожий».
+        self._declared_on: weakref.WeakSet[Channel] = weakref.WeakSet()
+
+    async def _exchange_on(self, channel: Channel) -> AbstractExchange:
+        """
+        Получить exchange, объявив его только при первой встрече с каналом.
+
+        Объявление — это кадр `Exchange.Declare` и ожидание `Declare-Ok`,
+        то есть полный обмен с брокером. Он стоял на каждой публикации, а
+        публикации идут из воркера outbox по строке за раз — то есть два
+        обхода вместо одного на каждое событие платформы.
+
+        Наивно закэшировать один объект exchange нельзя: он привязан к
+        каналу, а каналы приходят из пула и переживают не всякую
+        публикацию. Поэтому кэшируется не объект, а **факт**: на этом
+        канале объявление уже сделано. Дальше `get_exchange(ensure=False)`
+        собирает объект локально, не разговаривая с брокером вовсе. Пул
+        маленький и постоянный, так что после прогрева лишних обходов не
+        остаётся ни одного.
+
+        Почему помнить это безопасно: exchange durable и живёт на сервере
+        дольше любого нашего канала, так что повторное объявление ничего
+        бы не изменило. Единственный случай, когда память устаревает, —
+        exchange удалили снаружи; тогда публикация упадёт, и `publish`
+        ниже забывает канал, чтобы следующая попытка объявила его заново.
+
+        :param channel: канал из пула.
+        :return: exchange, в который можно публиковать.
+        """
+        if channel in self._declared_on:
+            return await channel.get_exchange(self.exchange_name, ensure=False)
+        exchange = await channel.declare_exchange(
+            name=self.exchange_name,
+            type=aio_pika.ExchangeType.TOPIC,
+            durable=True,
+            auto_delete=False,
+        )
+        self._declared_on.add(channel)
+        return exchange
 
     async def publish(self, event: Event) -> None:
         """
@@ -79,21 +126,26 @@ class RabbitEventPublisher:
         :param event: событие.
         """
         async with self.channel_pool.acquire() as channel:
-            exchange = await channel.declare_exchange(
-                name=self.exchange_name,
-                type=aio_pika.ExchangeType.TOPIC,
-                durable=True,
-                auto_delete=False,
-            )
-            await exchange.publish(
-                message=aio_pika.Message(
-                    body=event.model_dump_json().encode(),
-                    content_type="application/json",
-                    message_id=str(event.event_id),
-                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                ),
-                routing_key=event.routing_key.value,
-            )
+            exchange = await self._exchange_on(channel)
+            try:
+                await exchange.publish(
+                    message=aio_pika.Message(
+                        body=event.model_dump_json().encode(),
+                        content_type="application/json",
+                        message_id=str(event.event_id),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    ),
+                    routing_key=event.routing_key.value,
+                )
+            except Exception:
+                # Канал забывается, а не чинится: неудачная публикация —
+                # единственный признак, по которому видно, что помнить
+                # объявление на этом канале больше нельзя (exchange удалён
+                # снаружи, канал закрылся, брокер ответил ошибкой). Следующая
+                # попытка объявит заново и восстановится сама; повтор есть у
+                # обоих вызывающих — воркер outbox перечитает строку.
+                self._declared_on.discard(channel)
+                raise
 
 
 class EchoingEventPublisher:
