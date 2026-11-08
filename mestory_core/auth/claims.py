@@ -103,12 +103,27 @@ def verify_access_token(
     try:
         return AccessTokenClaims.model_validate(payload)
     except ValidationError as exc:
-        # `exc` — это ValidationError pydantic: имена внутренних полей
-        # модели, эхо присланных значений, ссылки на документацию pydantic
-        # errors.pydantic.dev, длина не ограничена. Наружу (в тело 401,
-        # которое видит клиент) это никогда не должно уйти — подробности
-        # только в лог, наружу — фиксированная нераскрывающая строка.
-        logger.info("Token claims failed validation: %s", exc)
+        # Наружу (в тело 401, которое видит клиент) не уходит ничего, кроме
+        # фиксированной строки: `ValidationError` pydantic несёт имена
+        # внутренних полей модели, ссылки на errors.pydantic.dev и не
+        # ограничен по длине.
+        #
+        # В лог тоже не всё. `str(exc)` вкладывает `input_value=` — то есть
+        # сами присланные значения, — и прежде в лог шёл именно он. Сегодня
+        # claims это `sub`, роли и флаг, так что цена невелика; модель
+        # вырастет, и тогда в агрегатор начнут попадать поля, которых там
+        # быть не должно, причём незаметно: строка в логе не меняется, её
+        # меняет добавление поля в модель.
+        #
+        # Поэтому логируется то, что нужно для разбора, и только оно: где
+        # (`loc`) и какого рода проблема (`type`). Этого хватает, чтобы
+        # отличить «пришёл токен старого формата» от «поле не того типа»,
+        # и не хватает, чтобы узнать содержимое токена.
+        problems = ", ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['type']}"
+            for error in exc.errors()
+        )
+        logger.info("Token claims failed validation (%s)", problems)
         raise jwt.InvalidTokenError(
             "Token claims failed validation.",
         ) from exc

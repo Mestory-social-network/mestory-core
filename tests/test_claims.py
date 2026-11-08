@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -314,3 +315,41 @@ def test_remaining_seconds_is_never_negative() -> None:
     )
 
     assert claims.remaining_seconds() == 0
+
+
+def test_the_log_names_the_bad_field_without_echoing_its_value(
+    key_pair: tuple[str, str],
+    make_token: Callable[..., str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Разбор нужен, содержимое токена в агрегаторе — нет.
+
+    `str(ValidationError)` у pydantic вкладывает `input_value=`, то есть
+    сами присланные значения, и прежде в лог шёл именно он. Сегодня claims
+    это `sub`, роли и флаг, так что цена невелика — но модель вырастет, и
+    тогда в агрегатор начнут попадать поля, которых там быть не должно,
+    причём незаметно: строка в логе не меняется, её меняет добавление поля
+    в модель. Поэтому утверждение здесь, а не в комментарии.
+
+    Утверждается и то, что лог не стал бесполезным: имя поля и род ошибки
+    остаются, и этого хватает, чтобы отличить токен старого формата от
+    поля не того типа.
+    """
+    _, public_pem = key_pair
+    sent_value = "roles-value-that-must-not-be-logged"
+
+    with caplog.at_level(logging.INFO), pytest.raises(jwt.InvalidTokenError):
+        verify_access_token(
+            make_token(roles=sent_value),
+            public_pem,
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert sent_value not in logged, (
+        "присланное значение попало в лог; при росте модели claims так же "
+        f"попадут и остальные поля: {logged}"
+    )
+    assert "roles" in logged
+    assert "list_type" in logged
