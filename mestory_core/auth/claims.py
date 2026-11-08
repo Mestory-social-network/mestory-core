@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import jwt
@@ -60,7 +61,7 @@ def verify_access_token(
     token: str,
     public_key: str,
     *,
-    audience: str,
+    audience: str | Sequence[str],
     issuer: str,
 ) -> AccessTokenClaims:
     """
@@ -72,7 +73,15 @@ def verify_access_token(
 
     :param token: закодированный токен.
     :param public_key: PEM публичного ключа, которым проверяется подпись.
-    :param audience: ожидаемая аудитория.
+    :param audience: ожидаемая аудитория — одна или несколько. Список
+        означает «подойдёт любая из них», как это и трактует PyJWT. Тип
+        расширен до `Sequence[str]` не ради будущего: `auth_service` уже
+        держит `jwt_audience` списком и передаёт его сюда, а `profile_service`
+        и `media_service` — строкой. Пока пакет не отдавал информацию о типах,
+        всё это приходило потребителям как `Any` и расхождение было невидимо
+        проверке типов, оставаясь безвредным в рантайме. Сужать до `str`
+        означало бы ломать конфигурацию `auth_service`, которая пользуется
+        именно множественной аудиторией.
     :param issuer: ожидаемый издатель.
     :return: проверенные claims.
     :raises jwt.InvalidTokenError: если токен повреждён, истёк, подписан

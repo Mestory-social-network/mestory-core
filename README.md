@@ -92,8 +92,7 @@ async def me(
     claims: AccessTokenClaims = Depends(
         require_permissions(Permission.USER_READ_SELF),
     ),
-) -> ProfileRead:
-    ...
+) -> ProfileRead: ...
 ```
 
 ## Три исхода проверки токена — и почему их нельзя путать
