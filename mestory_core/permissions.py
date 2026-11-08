@@ -10,12 +10,6 @@ ROLE_ADMIN = "admin"
 DEFAULT_ROLE = ROLE_USER
 ALL_ROLES: tuple[str, ...] = (ROLE_USER, ROLE_MODERATOR, ROLE_ADMIN)
 
-ROLE_DESCRIPTIONS: dict[str, str] = {
-    ROLE_USER: "Regular user, manages only their own account.",
-    ROLE_MODERATOR: "Reads and updates any account, cannot delete or grant roles.",
-    ROLE_ADMIN: "Full control, including role assignment.",
-}
-
 
 class Permission(enum.StrEnum):
     """Actions that can be granted to a role."""
