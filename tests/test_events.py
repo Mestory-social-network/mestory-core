@@ -61,9 +61,24 @@ def test_routing_key_is_not_a_payload_field() -> None:
 
 
 def test_every_event_class_has_a_distinct_routing_key() -> None:
-    """Два события не делят один ключ — иначе потребитель их не различит."""
-    subclasses = _all_subclasses(Event)
-    keys = [subclass.routing_key for subclass in subclasses]
+    """Два события не делят один ключ — иначе потребитель их не различит.
+
+    Нарушить это теперь нельзя: `Event.__init_subclass__` отвергает занятый
+    ключ при объявлении, то есть при импорте. Тест остаётся сторожем на
+    случай, если проверку оттуда уберут, и заодно описывает свойство в том
+    месте, где его ищут.
+
+    Классы без собственного ключа отфильтрованы, и это не формальность:
+    объявление, которое `__init_subclass__` отверг, всё равно остаётся в
+    `__subclasses__()` — объект класса создан, связь с родителем
+    установлена до вызова, — так что обход может встретить такой класс
+    после теста, который проверял сам отказ.
+    """
+    keys = [
+        subclass.routing_key
+        for subclass in _all_subclasses(Event)
+        if "routing_key" in subclass.__dict__
+    ]
 
     assert len(keys) == len(set(keys))
 

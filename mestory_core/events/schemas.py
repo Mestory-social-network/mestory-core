@@ -2,11 +2,25 @@
 
 import uuid
 from datetime import UTC, datetime
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
 from mestory_core.events.keys import RoutingKey
+
+# Единый источник правды для потребителя: получив из AMQP routing_key и
+# сырое тело, он находит здесь класс и валидирует тело через
+# model_validate_json — той же моделью, которой издатель его собрал.
+#
+# Наполняется в `Event.__init_subclass__`, то есть в момент объявления
+# подкласса. Прежде карта собиралась обходом `__subclasses__()` одной
+# строкой в конце модуля, и это работало только потому, что все подклассы
+# лежат здесь: `__subclasses__()` видит лишь то, что уже определено к
+# моменту вызова, так что подкласс `Event`, заведённый потребителем в своём
+# модуле, в карту не попадал молча — а молча означало бы, что его
+# сообщения дедуплицируются и разбираются не той моделью, которой собраны,
+# либо отбраковываются как неизвестный ключ.
+EVENTS_BY_ROUTING_KEY: dict[RoutingKey, type["Event"]] = {}
 
 
 class Event(BaseModel):
@@ -21,6 +35,51 @@ class Event(BaseModel):
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     routing_key: ClassVar[RoutingKey]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """
+        Записать подкласс в карту ключей, как только он объявлен.
+
+        Регистрация здесь, а не обходом дерева подклассов в конце модуля:
+        обход зависит от того, что успело импортироваться, а объявление —
+        нет. Подкласс, заведённый в любом другом модуле, оказывается в
+        карте тем же действием, которым он создаётся.
+
+        Свой `routing_key` обязателен, и проверяется именно `cls.__dict__`,
+        а не `getattr`: унаследованный ключ принадлежит родителю, и
+        подкласс, забывший назвать свой, молча занял бы его место в карте.
+        Общую часть нескольких событий поэтому заводят примесью, а не
+        подклассом `Event` без ключа.
+
+        Дубликат ключа отвергается, а не затирается. Прежняя карта
+        оставляла последнее совпадение, и два события с одним ключом
+        разошлись бы с тем, как их разбирает потребитель, — но заметить это
+        можно было бы только по сообщениям, разобранным не той моделью.
+
+        Оба отказа происходят при объявлении, то есть при импорте модуля,
+        который это натворил, а не на первом сообщении в проде.
+
+        :param kwargs: аргументы класса, передаются дальше по MRO.
+        :raises TypeError: если подкласс не назвал своего ключа или ключ уже
+            занят другим классом.
+        """
+        super().__init_subclass__(**kwargs)
+        key = cls.__dict__.get("routing_key")
+        if key is None:
+            message = (
+                f"{cls.__name__} does not declare a routing_key of its own; "
+                "every Event subclass is an event, and shared fields belong "
+                "in a mixin rather than in a keyless subclass"
+            )
+            raise TypeError(message)
+        registered = EVENTS_BY_ROUTING_KEY.get(key)
+        if registered is not None and registered is not cls:
+            message = (
+                f"routing key {key.value!r} is already registered to "
+                f"{registered.__name__}; {cls.__name__} cannot take it too"
+            )
+            raise TypeError(message)
+        EVENTS_BY_ROUTING_KEY[key] = cls
 
 
 class UserRegistered(Event):
@@ -175,11 +234,12 @@ class ProfileDeleted(Event):
 
 def _all_event_types(base: type[Event]) -> list[type[Event]]:
     """
-    Собрать все конкретные подклассы события.
+    Собрать все подклассы события обходом дерева.
 
-    Тем же обходом, каким тесты проверяют уникальность ключей: рекурсивно
-    по дереву `__subclasses__()`, а не ручным перечислением, которое
-    разойдётся со схемами при первом же добавленном событии.
+    Карту больше не строит — её наполняет `Event.__init_subclass__`. Обход
+    остался потому, что он отвечает на другой вопрос: что вообще объявлено,
+    включая класс, который забыл назвать свой `routing_key` и потому в
+    карту не попал. Сверка одного с другим и есть проверка на такой пропуск.
 
     :param base: базовый класс, с которого начинать обход.
     :return: список подклассов `base`.
@@ -189,20 +249,6 @@ def _all_event_types(base: type[Event]) -> list[type[Event]]:
         found.append(subclass)
         found.extend(_all_event_types(subclass))
     return found
-
-
-# Единый источник правды для потребителя: получив из AMQP routing_key и
-# сырое тело, он находит здесь класс и валидирует тело через
-# model_validate_json — той же моделью, которой издатель его собрал.
-#
-# `_all_event_types(Event)` детерминирован, только пока эта строка стоит
-# НИЖЕ всех подклассов Event в этом модуле: `__subclasses__()` видит лишь то,
-# что уже определено (импортировано) на момент вызова. Подкласс `Event`,
-# заведённый потребителем в собственном модуле, в этой карте не появится
-# молча — если только тот модуль не был импортирован до этой строки.
-EVENTS_BY_ROUTING_KEY: dict[RoutingKey, type[Event]] = {
-    event_type.routing_key: event_type for event_type in _all_event_types(Event)
-}
 
 
 __all__ = [
